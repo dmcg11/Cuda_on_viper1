@@ -38,7 +38,6 @@ nvcc --version
 If `nvcc` is not found at all, install JetPack components first:
 
 ```bash
-sudo apt-get update
 sudo apt-get install -y nvidia-jetpack
 ```
 
@@ -47,7 +46,6 @@ sudo apt-get install -y nvidia-jetpack
 ## Step 3 — Install Dependencies
 
 ```bash
-sudo apt-get update
 sudo apt-get install -y \
     build-essential cmake git pkg-config \
     libjpeg-dev libtiff-dev libpng-dev \
