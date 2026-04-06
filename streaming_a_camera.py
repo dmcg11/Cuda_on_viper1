@@ -89,7 +89,7 @@ def open_camera():
 # ── Controls UI ───────────────────────────────────────────────────────────────
 def create_controls():
     cv2.namedWindow(CTRL_WIN, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(CTRL_WIN, 500, 320)
+    cv2.resizeWindow(CTRL_WIN, 500, 360)
     cv2.createTrackbar("Exposure (rows)", CTRL_WIN, 1000, 1118, lambda x: None)
     cv2.createTrackbar("Analog Gain x16", CTRL_WIN,   16,  248, lambda x: None)
     cv2.createTrackbar("AWB R x100",      CTRL_WIN,   82,  800, lambda x: None)
@@ -97,6 +97,7 @@ def create_controls():
     cv2.createTrackbar("AWB B x100",      CTRL_WIN,  800,  800, lambda x: None)
     # AWB mode: 0 = manual, 1 = auto
     cv2.createTrackbar("Brightness",      CTRL_WIN,    0,  100, lambda x: None)
+    cv2.createTrackbar("Tonemap x10",     CTRL_WIN,   20,  100, lambda x: None)
     cv2.createTrackbar("Auto WB (1=on)",  CTRL_WIN,    0,    1, lambda x: None)  # off by default
 
 def get_controls():
@@ -107,6 +108,7 @@ def get_controls():
         max(cv2.getTrackbarPos("AWB G x100",      CTRL_WIN), 1) / 100.0,
         max(cv2.getTrackbarPos("AWB B x100",      CTRL_WIN), 1) / 100.0,
         max(cv2.getTrackbarPos("Brightness",       CTRL_WIN), 1) / 100.0,
+        cv2.getTrackbarPos("Tonemap x10",      CTRL_WIN) / 10.0,
         cv2.getTrackbarPos("Auto WB (1=on)",  CTRL_WIN) == 1,
     )
 
@@ -141,8 +143,8 @@ def main():
     bayer16 = np.empty((HEIGHT, WIDTH), dtype=np.uint16)
     stream  = cv2.cuda_Stream()
 
-    prev_controls    = (None,) * 7
-    pending_controls = (None,) * 7
+    prev_controls    = (None,) * 8
+    pending_controls = (None,) * 8
     debounce_count   = 0
     DEBOUNCE_FRAMES  = 3
 
@@ -174,9 +176,9 @@ def main():
         # ── I2C writes immediately after cap.read() ───────────────────────────
         # cap.read() returns at the start of frame readout, so writing here
         # minimises the chance of a mid-frame register change causing banding
-        exposure, analog_gain, man_r, man_g, man_b, brightness, auto_wb = get_controls()
+        exposure, analog_gain, man_r, man_g, man_b, brightness, tonemap_strength, auto_wb = get_controls()
 
-        controls = (exposure, analog_gain, man_r, man_g, man_b, brightness, auto_wb)
+        controls = (exposure, analog_gain, man_r, man_g, man_b, brightness, tonemap_strength, auto_wb)
         if controls != pending_controls:
             pending_controls = controls
             debounce_count   = 0
