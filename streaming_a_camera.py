@@ -88,14 +88,14 @@ def open_camera():
 def create_controls():
     cv2.namedWindow(CTRL_WIN, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(CTRL_WIN, 500, 320)
-    cv2.createTrackbar("Exposure (rows)", CTRL_WIN,  200, 1118, lambda x: None)
-    cv2.createTrackbar("Analog Gain x16", CTRL_WIN,   16,  248, lambda x: None)
-    cv2.createTrackbar("AWB R x100",      CTRL_WIN,  100,  800, lambda x: None)
+    cv2.createTrackbar("Exposure (rows)", CTRL_WIN,  375, 1118, lambda x: None)
+    cv2.createTrackbar("Analog Gain x16", CTRL_WIN,  139,  248, lambda x: None)
+    cv2.createTrackbar("AWB R x100",      CTRL_WIN,   82,  800, lambda x: None)
     cv2.createTrackbar("AWB G x100",      CTRL_WIN,  100,  800, lambda x: None)
-    cv2.createTrackbar("AWB B x100",      CTRL_WIN,  100,  800, lambda x: None)
+    cv2.createTrackbar("AWB B x100",      CTRL_WIN,  800,  800, lambda x: None)
     cv2.createTrackbar("Brightness",      CTRL_WIN,   25,  100, lambda x: None)
     # AWB mode: 0 = manual, 1 = auto
-    cv2.createTrackbar("Auto WB (1=on)",  CTRL_WIN,    1,    1, lambda x: None)
+    cv2.createTrackbar("Auto WB (1=on)",  CTRL_WIN,    0,    1, lambda x: None)
 
 def get_controls():
     return (
