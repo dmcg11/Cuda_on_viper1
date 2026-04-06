@@ -251,6 +251,12 @@ def main():
         cv2.namedWindow("RAW12 Camera (GPU debayer)", cv2.WINDOW_NORMAL)
         cv2.imshow("RAW12 Camera (GPU debayer)", display)
 
+        # ── Debug: print dark area pixel values once ────────────────────────
+        if snapshot_saved and not video_saved and len(video_buffer) == 0:
+            dark_mean = bgr8[800:1000, 600:800].mean()
+            light_mean = bgr8[200:400, 550:750].mean()
+            print(f"Dark area mean: {dark_mean:.1f}  Light area mean: {light_mean:.1f}")
+
         # ── Auto snapshot + video clip 5 seconds after start ────────────────
         if not snapshot_saved and (time.time() - start_time) >= SNAPSHOT_DELAY:
             snapshot_path = "/tmp/camera_snapshot.jpg"
