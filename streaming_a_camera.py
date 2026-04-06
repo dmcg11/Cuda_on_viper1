@@ -69,6 +69,7 @@ def main():
     prev_gains = (None, None, None, None)
     alpha_b = alpha_g = alpha_r = 0.25
 
+    cv2.namedWindow("RAW12 Camera (GPU debayer)", cv2.WINDOW_NORMAL)
     print("Press 'q' to quit, 'w' to print channel averages for WB tuning")
 
     frame_count = 0
