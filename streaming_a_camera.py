@@ -12,11 +12,6 @@ BAYER_PAT   = cv2.COLOR_BayerBG2BGR  # BGGR pattern
 
 CTRL_WIN = "White Balance Controls"
 
-def unpack_raw12_unpacked(raw_bytes, width, height):
-    raw = np.frombuffer(raw_bytes, dtype=np.uint16)
-    return raw.reshape(height, width)
-
-
 def open_camera():
     cap = cv2.VideoCapture(DEVICE, cv2.CAP_V4L2)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'BG12'))
@@ -61,14 +56,14 @@ def main():
     gpu_bgr16  = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_16UC3)
     gpu_bgr8   = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC3)
 
-    # Per-channel GPU mats for white balance
-    gpu_b      = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC1)
-    gpu_g      = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC1)
-    gpu_r      = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC1)
-    gpu_b_wb   = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC1)
-    gpu_g_wb   = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC1)
-    gpu_r_wb   = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC1)
-    gpu_wb     = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC3)
+    # Pre-allocate reusable numpy array to avoid per-frame allocation
+    bayer16 = np.empty((HEIGHT, WIDTH), dtype=np.uint16)
+
+    # Pre-build WB LUTs (lookup tables) — fastest CPU white balance method
+    # LUT maps 0-255 input to 0-255 output per channel, applied after download
+    lut_r = np.arange(256, dtype=np.uint8)
+    lut_g = np.arange(256, dtype=np.uint8)
+    lut_b = np.arange(256, dtype=np.uint8)
 
     stream = cv2.cuda_Stream()
 
@@ -77,6 +72,7 @@ def main():
     frame_count = 0
     fps_display = 0.0
     t0 = time.time()
+    prev_gains = (None, None, None, None)
 
     while True:
         ret, raw_frame = cap.read()
@@ -86,25 +82,33 @@ def main():
 
         r_gain, g_gain, b_gain, brightness = get_controls()
 
-        # ── CPU: Reinterpret buffer as uint16 Bayer ───────────────────────────
-        bayer16 = unpack_raw12_unpacked(raw_frame.tobytes(), WIDTH, HEIGHT)
+        # ── Rebuild LUTs only when gains change ───────────────────────────────
+        gains = (r_gain, g_gain, b_gain, brightness)
+        if gains != prev_gains:
+            lut_r = np.clip(np.arange(256) * r_gain, 0, 255).astype(np.uint8)
+            lut_g = np.clip(np.arange(256) * g_gain, 0, 255).astype(np.uint8)
+            lut_b = np.clip(np.arange(256) * b_gain, 0, 255).astype(np.uint8)
+            prev_gains = gains
+
+        # ── CPU: Zero-copy reinterpret buffer as uint16 Bayer ─────────────────
+        np.copyto(bayer16, raw_frame.view(np.uint16).reshape(HEIGHT, WIDTH))
 
         # ── GPU: Upload → Demosaic → Scale to 8-bit ───────────────────────────
         gpu_bayer.upload(bayer16, stream)
         cv2.cuda.demosaicing(gpu_bayer, BAYER_PAT, gpu_bgr16, stream=stream)
         gpu_bgr16.convertTo(cv2.CV_8UC3, brightness, gpu_bgr8, 0)
 
-        # ── GPU: White balance — split, scale each channel, merge ─────────────
-        # convertTo(rtype, alpha, dst, beta) scales and clips to uint8 range
-        cv2.cuda.split(gpu_bgr8, [gpu_b, gpu_g, gpu_r], stream=stream)
-        gpu_b.convertTo(cv2.CV_8UC1, b_gain, gpu_b_wb, 0)
-        gpu_g.convertTo(cv2.CV_8UC1, g_gain, gpu_g_wb, 0)
-        gpu_r.convertTo(cv2.CV_8UC1, r_gain, gpu_r_wb, 0)
-        cv2.cuda.merge([gpu_b_wb, gpu_g_wb, gpu_r_wb], gpu_wb, stream=stream)
-
         # ── Download ──────────────────────────────────────────────────────────
         stream.waitForCompletion()
-        bgr8 = gpu_wb.download()
+        bgr8 = gpu_bgr8.download()
+
+        # ── White balance via LUT (fastest CPU method — single table lookup) ──
+        b_ch, g_ch, r_ch = cv2.split(bgr8)
+        bgr8 = cv2.merge([
+            cv2.LUT(b_ch, lut_b),
+            cv2.LUT(g_ch, lut_g),
+            cv2.LUT(r_ch, lut_r)
+        ])
 
         # ── FPS counter ───────────────────────────────────────────────────────
         frame_count += 1
@@ -117,7 +121,7 @@ def main():
         # ── Overlay ───────────────────────────────────────────────────────────
         cv2.putText(bgr8, f"FPS: {fps_display:.1f}", (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        cv2.putText(bgr8, f"R:{r_gain:.2f} G:{g_gain:.2f} B:{b_gain:.2f}  Brightness:{brightness:.2f}",
+        cv2.putText(bgr8, f"R:{r_gain:.2f} G:{g_gain:.2f} B:{b_gain:.2f}  Bri:{brightness:.2f}",
                     (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
 
         cv2.imshow("RAW12 Camera (GPU debayer)", bgr8)
