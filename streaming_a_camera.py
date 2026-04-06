@@ -44,7 +44,7 @@ def create_controls():
     cv2.createTrackbar("R Gain  x100", CTRL_WIN, 100, 400, lambda x: None)
     cv2.createTrackbar("G Gain  x100", CTRL_WIN, 100, 400, lambda x: None)
     cv2.createTrackbar("B Gain  x100", CTRL_WIN, 100, 400, lambda x: None)
-    cv2.createTrackbar("Brightness",   CTRL_WIN,  35, 100, lambda x: None)
+    cv2.createTrackbar("Brightness",   CTRL_WIN,  50, 100, lambda x: None)
     # AWB toggle: 0 = manual, 1 = auto
     cv2.createTrackbar("AWB (0=off)",  CTRL_WIN,   1,   1, lambda x: None)
 
@@ -148,17 +148,20 @@ def main():
 
         gains = (eff_r, eff_g, eff_b, brightness, awb_on)
         if gains != prev_gains:
-            alpha_b    = brightness * eff_b
-            alpha_g    = brightness * eff_g
-            alpha_r    = brightness * eff_r
+            # Scale factor: map 16-bit post-black-level range to 8-bit
+            # 255 / (65535 - 1760) ≈ 0.004, multiplied by brightness (0-1) and gain
+            scale = brightness * 0.004
+            alpha_b    = scale * eff_b
+            alpha_g    = scale * eff_g
+            alpha_r    = scale * eff_r
             prev_gains = gains
 
-        # ── CPU: Zero-copy reinterpret ────────────────────────────────────────
+        # ── CPU: Reinterpret + black level correction ────────────────────────
+        # Sensor outputs left-shifted 16-bit values (12-bit << 4)
+        # Black level offset is ~1760, subtract and clamp to get true signal
         np.copyto(bayer16, raw_frame.view(np.uint16).reshape(HEIGHT, WIDTH))
-
-        # ── Debug: print black level once ────────────────────────────────────
-        if frame_count == 0:
-            print(f"Min: {bayer16.min()}  Max: {bayer16.max()}  Mean: {bayer16.mean():.1f}")
+        np.subtract(bayer16, 1760, out=bayer16, casting='unsafe')
+        np.clip(bayer16, 0, 65535, out=bayer16)
 
         # ── GPU: Upload → Demosaic ────────────────────────────────────────────
         gpu_bayer.upload(bayer16, stream)
