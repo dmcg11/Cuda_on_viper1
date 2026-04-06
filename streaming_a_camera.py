@@ -14,7 +14,7 @@ DISPLAY_W     = int(WIDTH  * DISPLAY_SCALE)
 DISPLAY_H     = int(HEIGHT * DISPLAY_SCALE)
 # ─────────────────────────────────────────────────────────────────────────────
 
-CTRL_WIN = "White Balance Controls"
+CTRL_WIN = "Controls"
 
 def open_camera():
     cap = cv2.VideoCapture(DEVICE, cv2.CAP_V4L2)
@@ -34,30 +34,31 @@ def open_camera():
 
 def create_controls():
     cv2.namedWindow(CTRL_WIN, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(CTRL_WIN, 500, 200)
+    cv2.resizeWindow(CTRL_WIN, 500, 250)
     cv2.createTrackbar("R Gain  x100", CTRL_WIN, 160, 400, lambda x: None)
     cv2.createTrackbar("G Gain  x100", CTRL_WIN, 100, 400, lambda x: None)
     cv2.createTrackbar("B Gain  x100", CTRL_WIN, 140, 400, lambda x: None)
     cv2.createTrackbar("Brightness",   CTRL_WIN,  25, 100, lambda x: None)
+    # Sharpness: 0 = off, 1-20 = strength (stored as int, divide by 10)
+    cv2.createTrackbar("Sharpness x10",CTRL_WIN,   0,  20, lambda x: None)
 
 
 def get_controls():
-    r_gain     = max(cv2.getTrackbarPos("R Gain  x100", CTRL_WIN), 1) / 100.0
-    g_gain     = max(cv2.getTrackbarPos("G Gain  x100", CTRL_WIN), 1) / 100.0
-    b_gain     = max(cv2.getTrackbarPos("B Gain  x100", CTRL_WIN), 1) / 100.0
-    brightness = max(cv2.getTrackbarPos("Brightness",   CTRL_WIN), 1) / 100.0
-    return r_gain, g_gain, b_gain, brightness
+    r_gain    = max(cv2.getTrackbarPos("R Gain  x100", CTRL_WIN), 1) / 100.0
+    g_gain    = max(cv2.getTrackbarPos("G Gain  x100", CTRL_WIN), 1) / 100.0
+    b_gain    = max(cv2.getTrackbarPos("B Gain  x100", CTRL_WIN), 1) / 100.0
+    brightness= max(cv2.getTrackbarPos("Brightness",   CTRL_WIN), 1) / 100.0
+    sharpness = cv2.getTrackbarPos("Sharpness x10", CTRL_WIN) / 10.0
+    return r_gain, g_gain, b_gain, brightness, sharpness
 
 
 def main():
     cap = open_camera()
     create_controls()
 
-    # GPU mats for full pipeline
+    # GPU mats
     gpu_bayer  = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_16UC1)
     gpu_bgr16  = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_16UC3)
-
-    # Separate 16-bit single-channel mats for per-channel WB on GPU
     gpu_b16    = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_16UC1)
     gpu_g16    = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_16UC1)
     gpu_r16    = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_16UC1)
@@ -65,12 +66,19 @@ def main():
     gpu_g8     = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC1)
     gpu_r8     = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC1)
     gpu_bgr8   = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC3)
+    gpu_blurred= cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC3)
+    gpu_sharp  = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC3)
 
     bayer16    = np.empty((HEIGHT, WIDTH), dtype=np.uint16)
     stream     = cv2.cuda_Stream()
-    prev_gains = (None, None, None, None)
 
-    # Cache combined alphas (brightness * gain per channel)
+    # Pre-create Gaussian blur filter for unsharp mask
+    # Kernel size 5x5, sigma 1.0 — good balance of speed vs quality
+    blur_filter = cv2.cuda.createGaussianFilter(
+        cv2.CV_8UC3, cv2.CV_8UC3, (5, 5), 1.0
+    )
+
+    prev_gains  = (None, None, None, None, None)
     alpha_b = alpha_g = alpha_r = 0.25
 
     print("Press 'q' to quit, 'w' to print channel averages for WB tuning")
@@ -85,16 +93,13 @@ def main():
             print("Failed to grab frame")
             break
 
-        r_gain, g_gain, b_gain, brightness = get_controls()
-        gains = (r_gain, g_gain, b_gain, brightness)
+        r_gain, g_gain, b_gain, brightness, sharpness = get_controls()
+        gains = (r_gain, g_gain, b_gain, brightness, sharpness)
 
-        # Recompute combined alpha only when sliders change
         if gains != prev_gains:
-            # Combine brightness + WB gain into a single alpha per channel
-            # convertTo maps 16-bit (0-4095) → 8-bit (0-255) in one step
-            alpha_b = brightness * b_gain
-            alpha_g = brightness * g_gain
-            alpha_r = brightness * r_gain
+            alpha_b    = brightness * b_gain
+            alpha_g    = brightness * g_gain
+            alpha_r    = brightness * r_gain
             prev_gains = gains
 
         # ── CPU: Zero-copy reinterpret ────────────────────────────────────────
@@ -104,16 +109,30 @@ def main():
         gpu_bayer.upload(bayer16, stream)
         cv2.cuda.demosaicing(gpu_bayer, BAYER_PAT, gpu_bgr16, stream=stream)
 
-        # ── GPU: Split 16-bit → apply brightness+WB per channel → merge 8-bit ─
+        # ── GPU: Split → brightness+WB per channel → merge ───────────────────
         cv2.cuda.split(gpu_bgr16, [gpu_b16, gpu_g16, gpu_r16], stream=stream)
         gpu_b16.convertTo(cv2.CV_8UC1, alpha_b, gpu_b8, 0)
         gpu_g16.convertTo(cv2.CV_8UC1, alpha_g, gpu_g8, 0)
         gpu_r16.convertTo(cv2.CV_8UC1, alpha_r, gpu_r8, 0)
         cv2.cuda.merge([gpu_b8, gpu_g8, gpu_r8], gpu_bgr8, stream=stream)
 
+        # ── GPU: Unsharp mask (only if sharpness > 0) ────────────────────────
+        if sharpness > 0:
+            # Unsharp mask: sharpened = original + strength * (original - blurred)
+            # Rearranged:   sharpened = (1 + strength) * original - strength * blurred
+            blur_filter.apply(gpu_bgr8, gpu_blurred, stream=stream)
+            cv2.cuda.addWeighted(
+                gpu_bgr8,   1.0 + sharpness,   # boost original
+                gpu_blurred, -sharpness,         # subtract blur
+                0, gpu_sharp, stream=stream
+            )
+            output = gpu_sharp
+        else:
+            output = gpu_bgr8
+
         # ── Download ──────────────────────────────────────────────────────────
         stream.waitForCompletion()
-        bgr8 = gpu_bgr8.download()
+        bgr8 = output.download()
 
         # ── Resize for display ────────────────────────────────────────────────
         display = cv2.resize(bgr8, (DISPLAY_W, DISPLAY_H), interpolation=cv2.INTER_NEAREST)
@@ -128,7 +147,8 @@ def main():
 
         cv2.putText(display, f"FPS: {fps_display:.1f}", (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        cv2.putText(display, f"R:{r_gain:.2f} G:{g_gain:.2f} B:{b_gain:.2f}  Bri:{brightness:.2f}",
+        cv2.putText(display, f"R:{r_gain:.2f} G:{g_gain:.2f} B:{b_gain:.2f}  "
+                             f"Bri:{brightness:.2f}  Sharp:{sharpness:.1f}",
                     (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
 
         cv2.imshow("RAW12 Camera (GPU debayer)", display)
