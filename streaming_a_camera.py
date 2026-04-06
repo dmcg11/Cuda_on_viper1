@@ -161,7 +161,10 @@ def main():
     bayer16    = np.empty((HEIGHT, WIDTH), dtype=np.uint16)
     stream     = cv2.cuda_Stream()
 
-    prev_controls = (None,) * 6
+    prev_controls   = (None,) * 6
+    pending_controls = (None,) * 6
+    debounce_count   = 0
+    DEBOUNCE_FRAMES  = 3   # wait this many stable frames before writing to sensor
     alpha_b = alpha_g = alpha_r = 0.25
 
     print("Press 'q' to quit")
@@ -179,17 +182,22 @@ def main():
         exposure, analog_gain, awb_r, awb_g, awb_b, brightness = get_controls()
         controls = (exposure, analog_gain, awb_r, awb_g, awb_b, brightness)
 
-        # Write to sensor registers only when controls change
-        if controls != prev_controls and bus is not None:
+        # Debounced register writes — only write after value stable for N frames
+        if controls != pending_controls:
+            pending_controls = controls
+            debounce_count   = 0
+        else:
+            debounce_count += 1
+
+        if debounce_count == DEBOUNCE_FRAMES and controls != prev_controls and bus is not None:
             try:
                 if exposure    != prev_controls[0]: set_exposure(bus, exposure)
                 if analog_gain != prev_controls[1]: set_analog_gain(bus, analog_gain)
-                if (awb_r, awb_g, awb_b) != prev_controls[2:5]:
+                if controls[2:5] != prev_controls[2:5]:
                     set_awb_gain(bus, awb_r, awb_g, awb_b)
             except Exception as e:
                 print(f"I2C write error: {e}")
 
-            # Recompute display alpha from brightness only (AWB now done in sensor)
             alpha_b = alpha_g = alpha_r = brightness
             prev_controls = controls
 
