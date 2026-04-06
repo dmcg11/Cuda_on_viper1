@@ -156,6 +156,10 @@ def main():
         # ── CPU: Zero-copy reinterpret ────────────────────────────────────────
         np.copyto(bayer16, raw_frame.view(np.uint16).reshape(HEIGHT, WIDTH))
 
+        # ── Debug: print black level once ────────────────────────────────────
+        if frame_count == 0:
+            print(f"Min: {bayer16.min()}  Max: {bayer16.max()}  Mean: {bayer16.mean():.1f}")
+
         # ── GPU: Upload → Demosaic ────────────────────────────────────────────
         gpu_bayer.upload(bayer16, stream)
         cv2.cuda.demosaicing(gpu_bayer, BAYER_PAT, gpu_bgr16, stream=stream)
