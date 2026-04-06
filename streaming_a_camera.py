@@ -72,7 +72,7 @@ def main():
 
         # ── GPU: Scale to 8-bit (alpha=1/16 maps 12-bit range to 8-bit) ──────
         # args: (rtype, alpha, dst, beta)
-        gpu_bgr16.convertTo(cv2.CV_8UC3, 1/16, gpu_bgr8, 0)
+        gpu_bgr16.convertTo(cv2.CV_8UC3, 1/4, gpu_bgr8, 0)
 
         # ── Download to CPU for display ───────────────────────────────────────
         stream.waitForCompletion()
