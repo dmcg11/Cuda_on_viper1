@@ -60,15 +60,23 @@ def get_controls():
 
 def compute_awb_gains(bgr8, current_r, current_g, current_b):
     """
-    Gray world assumption AWB:
-    Assumes the average color of the scene should be neutral gray.
-    Computes per-channel gain to make R_avg == G_avg == B_avg.
-    Smoothed to avoid flickering.
+    Gray world AWB with midtone masking.
+    Excludes very dark pixels (lens border) and very bright pixels (blown highlights)
+    so they don't skew the color estimate.
     """
     b, g, r = cv2.split(bgr8)
-    r_avg = float(np.mean(r)) + 1e-6
-    g_avg = float(np.mean(g)) + 1e-6
-    b_avg = float(np.mean(b)) + 1e-6
+
+    # Only use pixels in the midtone range (not too dark, not blown out)
+    gray = cv2.cvtColor(bgr8, cv2.COLOR_BGR2GRAY)
+    mask = (gray > 30) & (gray < 220)
+
+    if mask.sum() < 1000:
+        # Not enough valid pixels, return unchanged
+        return current_r, current_g, current_b
+
+    r_avg = float(r[mask].mean()) + 1e-6
+    g_avg = float(g[mask].mean()) + 1e-6
+    b_avg = float(b[mask].mean()) + 1e-6
 
     # Target: make all channels equal to the mean of all three
     target = (r_avg + g_avg + b_avg) / 3.0
@@ -77,7 +85,7 @@ def compute_awb_gains(bgr8, current_r, current_g, current_b):
     new_g = target / g_avg
     new_b = target / b_avg
 
-    # Normalize so G gain stays at 1.0 (G is reference)
+    # Normalize so G stays at 1.0 (G is reference)
     new_r = new_r / new_g
     new_b = new_b / new_g
     new_g = 1.0
