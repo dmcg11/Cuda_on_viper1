@@ -130,7 +130,8 @@ def main():
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
-        elif key == ord('w'):
+        # Auto-print WB suggestion every 5 seconds — point at white object for best results
+        if int(time.time()) % 5 == 0 and frame_count == 1:
             b, g, r = cv2.split(bgr8)
             print(f"Channel averages — R: {r.mean():.1f}  G: {g.mean():.1f}  B: {b.mean():.1f}")
             print(f"Suggested gains  — R: {g.mean()/max(r.mean(),1):.2f}x  B: {g.mean()/max(b.mean(),1):.2f}x")
