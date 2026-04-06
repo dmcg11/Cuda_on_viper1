@@ -148,20 +148,22 @@ def main():
 
         gains = (eff_r, eff_g, eff_b, brightness, awb_on)
         if gains != prev_gains:
-            # Scale factor: map 16-bit post-black-level range to 8-bit
-            # 255 / (65535 - 1760) ≈ 0.004, multiplied by brightness (0-1) and gain
-            scale = brightness * 0.004
+            # Scale factor: map 12-bit (0-4095) to 8-bit (0-255)
+            # 255 / 4095 = 0.0623
+            scale = brightness * 0.0623
             alpha_b    = scale * eff_b
             alpha_g    = scale * eff_g
             alpha_r    = scale * eff_r
             prev_gains = gains
 
         # ── CPU: Reinterpret + black level correction ────────────────────────
-        # Sensor outputs left-shifted 16-bit values (12-bit << 4)
-        # Black level offset is ~1760, subtract and clamp to get true signal
-        np.copyto(bayer16, raw_frame.view(np.uint16).reshape(HEIGHT, WIDTH))
-        np.subtract(bayer16, 1760, out=bayer16, casting='unsafe')
-        np.clip(bayer16, 0, 65535, out=bayer16)
+        # Sensor outputs 16-bit left-shifted values (12-bit data << 4)
+        # Black level in 16-bit domain is ~1760, which is 110 in 12-bit
+        # Right-shift to 12-bit first, then subtract black level, then clamp
+        raw16 = raw_frame.view(np.uint16).reshape(HEIGHT, WIDTH)
+        np.right_shift(raw16, 4, out=bayer16)   # convert to true 12-bit (0-4095)
+        np.subtract(bayer16, 110, out=bayer16, casting='unsafe')
+        np.clip(bayer16, 0, 4095, out=bayer16)
 
         # ── GPU: Upload → Demosaic ────────────────────────────────────────────
         gpu_bayer.upload(bayer16, stream)
