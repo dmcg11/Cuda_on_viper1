@@ -152,7 +152,11 @@ def main():
     frame_count = fps_display = 0
     t0 = time.time()
 
-    print("Press 'q' to quit")
+    print("Press 'q' to quit, 's' to save snapshot manually")
+
+    SNAPSHOT_DELAY = 5.0   # seconds after start before auto-saving
+    snapshot_saved = False
+    start_time     = time.time()
 
     while True:
         ret, raw_frame = cap.read()
@@ -237,8 +241,20 @@ def main():
         cv2.namedWindow("RAW12 Camera (GPU debayer)", cv2.WINDOW_NORMAL)
         cv2.imshow("RAW12 Camera (GPU debayer)", display)
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        # ── Auto snapshot 5 seconds after start ──────────────────────────────
+        if not snapshot_saved and (time.time() - start_time) >= SNAPSHOT_DELAY:
+            snapshot_path = "/tmp/camera_snapshot.jpg"
+            cv2.imwrite(snapshot_path, bgr8, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            print(f"Auto snapshot saved: {snapshot_path}")
+            snapshot_saved = True
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
             break
+        elif key == ord('s'):
+            snapshot_path = "/tmp/camera_snapshot.jpg"
+            cv2.imwrite(snapshot_path, bgr8, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            print(f"Manual snapshot saved: {snapshot_path}")
 
     if bus:
         bus.close()
