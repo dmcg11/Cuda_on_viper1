@@ -9,7 +9,6 @@ HEIGHT        = 1280
 FPS           = 30
 BAYER_PAT     = cv2.COLOR_BayerBG2BGR  # BGGR pattern
 
-# Display at half resolution to reduce NoMachine bandwidth
 DISPLAY_SCALE = 0.5
 DISPLAY_W     = int(WIDTH  * DISPLAY_SCALE)
 DISPLAY_H     = int(HEIGHT * DISPLAY_SCALE)
@@ -24,10 +23,8 @@ def open_camera():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
     cap.set(cv2.CAP_PROP_FPS,          FPS)
     cap.set(cv2.CAP_PROP_CONVERT_RGB,  0)
-
     if not cap.isOpened():
         raise RuntimeError("Failed to open /dev/video5")
-
     actual_w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     actual_fps = cap.get(cv2.CAP_PROP_FPS)
@@ -56,19 +53,27 @@ def main():
     cap = open_camera()
     create_controls()
 
+    # GPU mats for full pipeline
     gpu_bayer  = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_16UC1)
     gpu_bgr16  = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_16UC3)
+
+    # Separate 16-bit single-channel mats for per-channel WB on GPU
+    gpu_b16    = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_16UC1)
+    gpu_g16    = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_16UC1)
+    gpu_r16    = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_16UC1)
+    gpu_b8     = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC1)
+    gpu_g8     = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC1)
+    gpu_r8     = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC1)
     gpu_bgr8   = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC3)
+
     bayer16    = np.empty((HEIGHT, WIDTH), dtype=np.uint16)
-
-    lut_r = np.arange(256, dtype=np.uint8)
-    lut_g = np.arange(256, dtype=np.uint8)
-    lut_b = np.arange(256, dtype=np.uint8)
-
     stream     = cv2.cuda_Stream()
     prev_gains = (None, None, None, None)
 
-    print("Press 'q' to quit, 'w' for WB suggestions, '+'/'-' to adjust display scale")
+    # Cache combined alphas (brightness * gain per channel)
+    alpha_b = alpha_g = alpha_r = 0.25
+
+    print("Press 'q' to quit, 'w' to print channel averages for WB tuning")
 
     frame_count = 0
     fps_display = 0.0
@@ -82,29 +87,35 @@ def main():
 
         r_gain, g_gain, b_gain, brightness = get_controls()
         gains = (r_gain, g_gain, b_gain, brightness)
+
+        # Recompute combined alpha only when sliders change
         if gains != prev_gains:
-            lut_r = np.clip(np.arange(256) * r_gain, 0, 255).astype(np.uint8)
-            lut_g = np.clip(np.arange(256) * g_gain, 0, 255).astype(np.uint8)
-            lut_b = np.clip(np.arange(256) * b_gain, 0, 255).astype(np.uint8)
+            # Combine brightness + WB gain into a single alpha per channel
+            # convertTo maps 16-bit (0-4095) → 8-bit (0-255) in one step
+            alpha_b = brightness * b_gain
+            alpha_g = brightness * g_gain
+            alpha_r = brightness * r_gain
             prev_gains = gains
 
         # ── CPU: Zero-copy reinterpret ────────────────────────────────────────
         np.copyto(bayer16, raw_frame.view(np.uint16).reshape(HEIGHT, WIDTH))
 
-        # ── GPU: Upload → Demosaic → Scale to 8-bit ───────────────────────────
+        # ── GPU: Upload → Demosaic ────────────────────────────────────────────
         gpu_bayer.upload(bayer16, stream)
         cv2.cuda.demosaicing(gpu_bayer, BAYER_PAT, gpu_bgr16, stream=stream)
-        gpu_bgr16.convertTo(cv2.CV_8UC3, brightness, gpu_bgr8, 0)
+
+        # ── GPU: Split 16-bit → apply brightness+WB per channel → merge 8-bit ─
+        cv2.cuda.split(gpu_bgr16, [gpu_b16, gpu_g16, gpu_r16], stream=stream)
+        gpu_b16.convertTo(cv2.CV_8UC1, alpha_b, gpu_b8, 0)
+        gpu_g16.convertTo(cv2.CV_8UC1, alpha_g, gpu_g8, 0)
+        gpu_r16.convertTo(cv2.CV_8UC1, alpha_r, gpu_r8, 0)
+        cv2.cuda.merge([gpu_b8, gpu_g8, gpu_r8], gpu_bgr8, stream=stream)
 
         # ── Download ──────────────────────────────────────────────────────────
         stream.waitForCompletion()
         bgr8 = gpu_bgr8.download()
 
-        # ── White balance via LUT ─────────────────────────────────────────────
-        b_ch, g_ch, r_ch = cv2.split(bgr8)
-        bgr8 = cv2.merge([cv2.LUT(b_ch, lut_b), cv2.LUT(g_ch, lut_g), cv2.LUT(r_ch, lut_r)])
-
-        # ── Resize for display (reduces NoMachine bandwidth significantly) ────
+        # ── Resize for display ────────────────────────────────────────────────
         display = cv2.resize(bgr8, (DISPLAY_W, DISPLAY_H), interpolation=cv2.INTER_NEAREST)
 
         # ── FPS counter ───────────────────────────────────────────────────────
