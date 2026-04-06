@@ -1,7 +1,3 @@
-# Cuda_on_viper1
-cuda projects with Viper1
-
-
 # Building OpenCV with CUDA on Jetson Xavier NX (JetPack 5.x)
 
 **Target:** Jetson Xavier NX, JetPack 5.1.x (R35), CUDA 11.4, OpenCV 4.8.0
@@ -38,6 +34,7 @@ nvcc --version
 If `nvcc` is not found at all, install JetPack components first:
 
 ```bash
+sudo apt-get update
 sudo apt-get install -y nvidia-jetpack
 ```
 
@@ -46,6 +43,7 @@ sudo apt-get install -y nvidia-jetpack
 ## Step 3 — Install Dependencies
 
 ```bash
+sudo apt-get update
 sudo apt-get install -y \
     build-essential cmake git pkg-config \
     libjpeg-dev libtiff-dev libpng-dev \
@@ -254,3 +252,11 @@ print(f"Speedup: {cpu_time/gpu_time:.1f}x")
 - **Build OOM crash** — add swap in Step 4 and/or reduce to `make -j2`.
 - **`CUDA devices: 0` after install** — means CMake ran without nvcc visible. Clean build dir (`rm -rf *`) and redo from Step 6.
 - **`No module named cv2`** — the site-packages vs dist-packages symlink in Step 10 is missing.
+- **`CUDA devices: 0` and version shows 4.11.0 (or any version other than 4.8.0)** — a pip-installed OpenCV is shadowing the one you built. Check which one Python is loading and remove it:
+  ```bash
+  python3 -c "import cv2; print(cv2.__file__)"
+  # If it shows ~/.local/lib/... then run:
+  pip3 uninstall opencv-python
+  # or:
+  rm -rf ~/.local/lib/python3.8/site-packages/cv2
+  ```
