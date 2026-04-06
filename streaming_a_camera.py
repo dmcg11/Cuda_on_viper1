@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import time
+import threading
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DEVICE      = 5
@@ -47,6 +48,28 @@ def get_controls():
     return r_gain, g_gain, b_gain, brightness
 
 
+def display_thread(frame_holder, stop_event):
+    """
+    Runs in a separate thread — handles imshow and waitKey independently
+    so it never blocks the capture/GPU pipeline.
+    """
+    while not stop_event.is_set():
+        frame = frame_holder.get('frame')
+        fps   = frame_holder.get('fps', 0.0)
+        if frame is not None:
+            cv2.putText(frame, f"FPS: {fps:.1f}", (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            cv2.imshow("RAW12 Camera (GPU debayer)", frame)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            stop_event.set()
+            break
+        elif key == ord('w') and frame is not None:
+            b, g, r = cv2.split(frame)
+            print(f"Channel averages — R: {r.mean():.1f}  G: {g.mean():.1f}  B: {b.mean():.1f}")
+            print(f"Suggested gains  — R: {g.mean()/max(r.mean(),1):.2f}x  B: {g.mean()/max(b.mean(),1):.2f}x")
+
+
 def main():
     cap = open_camera()
     create_controls()
@@ -60,25 +83,27 @@ def main():
     lut_g = np.arange(256, dtype=np.uint8)
     lut_b = np.arange(256, dtype=np.uint8)
 
-    stream = cv2.cuda_Stream()
+    stream     = cv2.cuda_Stream()
+    stop_event = threading.Event()
 
-    print("Press 'q' to quit")
-    print("Profiling first 60 frames then printing timings...")
+    # Shared dict between capture thread and display thread
+    frame_holder = {'frame': None, 'fps': 0.0}
 
-    frame_count  = 0
-    fps_display  = 0.0
-    t0           = time.time()
-    prev_gains   = (None, None, None, None)
+    # Start display thread
+    disp_thread = threading.Thread(target=display_thread,
+                                   args=(frame_holder, stop_event),
+                                   daemon=True)
+    disp_thread.start()
 
-    # Profiling accumulators
-    t_capture = t_unpack = t_gpu = t_download = t_wb = t_display = 0.0
-    PROFILE_FRAMES = 60
+    print("Press 'q' to quit, 'w' to print channel averages for WB tuning")
 
-    while True:
-        # ── Capture ───────────────────────────────────────────────────────────
-        t = time.perf_counter()
+    frame_count = 0
+    fps_display = 0.0
+    t0          = time.time()
+    prev_gains  = (None, None, None, None)
+
+    while not stop_event.is_set():
         ret, raw_frame = cap.read()
-        t_capture += time.perf_counter() - t
         if not ret:
             print("Failed to grab frame")
             break
@@ -91,32 +116,23 @@ def main():
             lut_b = np.clip(np.arange(256) * b_gain, 0, 255).astype(np.uint8)
             prev_gains = gains
 
-        # ── Unpack ────────────────────────────────────────────────────────────
-        t = time.perf_counter()
+        # ── CPU: Zero-copy reinterpret ────────────────────────────────────────
         np.copyto(bayer16, raw_frame.view(np.uint16).reshape(HEIGHT, WIDTH))
-        t_unpack += time.perf_counter() - t
 
-        # ── GPU pipeline ──────────────────────────────────────────────────────
-        t = time.perf_counter()
+        # ── GPU: Upload → Demosaic → Scale to 8-bit ───────────────────────────
         gpu_bayer.upload(bayer16, stream)
         cv2.cuda.demosaicing(gpu_bayer, BAYER_PAT, gpu_bgr16, stream=stream)
         gpu_bgr16.convertTo(cv2.CV_8UC3, brightness, gpu_bgr8, 0)
-        t_gpu += time.perf_counter() - t
 
         # ── Download ──────────────────────────────────────────────────────────
-        t = time.perf_counter()
         stream.waitForCompletion()
         bgr8 = gpu_bgr8.download()
-        t_download += time.perf_counter() - t
 
-        # ── White balance ─────────────────────────────────────────────────────
-        t = time.perf_counter()
+        # ── White balance via LUT ─────────────────────────────────────────────
         b_ch, g_ch, r_ch = cv2.split(bgr8)
         bgr8 = cv2.merge([cv2.LUT(b_ch, lut_b), cv2.LUT(g_ch, lut_g), cv2.LUT(r_ch, lut_r)])
-        t_wb += time.perf_counter() - t
 
-        # ── Display ───────────────────────────────────────────────────────────
-        t = time.perf_counter()
+        # ── FPS counter ───────────────────────────────────────────────────────
         frame_count += 1
         elapsed = time.time() - t0
         if elapsed >= 1.0:
@@ -124,31 +140,11 @@ def main():
             frame_count = 0
             t0 = time.time()
 
-        cv2.putText(bgr8, f"FPS: {fps_display:.1f}", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        cv2.putText(bgr8, f"R:{r_gain:.2f} G:{g_gain:.2f} B:{b_gain:.2f}  Bri:{brightness:.2f}",
-                    (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
-        cv2.imshow("RAW12 Camera (GPU debayer)", bgr8)
-        t_display += time.perf_counter() - t
+        # ── Hand frame to display thread (non-blocking) ───────────────────────
+        frame_holder['frame'] = bgr8
+        frame_holder['fps']   = fps_display
 
-        # ── Print profile after N frames then reset ───────────────────────────
-        if frame_count == 0 and fps_display > 0 and \
-           (t_capture + t_unpack + t_gpu + t_download + t_wb + t_display) > 0:
-            total = t_capture + t_unpack + t_gpu + t_download + t_wb + t_display
-            print(f"\n── Profile over ~{PROFILE_FRAMES} frames ──────────────────")
-            print(f"  cap.read()   : {t_capture*1000/PROFILE_FRAMES:6.2f} ms/frame")
-            print(f"  unpack       : {t_unpack*1000/PROFILE_FRAMES:6.2f} ms/frame")
-            print(f"  GPU pipeline : {t_gpu*1000/PROFILE_FRAMES:6.2f} ms/frame")
-            print(f"  download     : {t_download*1000/PROFILE_FRAMES:6.2f} ms/frame")
-            print(f"  white bal    : {t_wb*1000/PROFILE_FRAMES:6.2f} ms/frame")
-            print(f"  display      : {t_display*1000/PROFILE_FRAMES:6.2f} ms/frame")
-            print(f"  TOTAL        : {total*1000/PROFILE_FRAMES:6.2f} ms/frame  →  {PROFILE_FRAMES/total:.1f} FPS")
-            t_capture = t_unpack = t_gpu = t_download = t_wb = t_display = 0.0
-
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            break
-
+    stop_event.set()
     cap.release()
     cv2.destroyAllWindows()
 
