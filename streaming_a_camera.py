@@ -1,14 +1,18 @@
 import cv2
 import numpy as np
 import time
-import threading
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DEVICE      = 5
-WIDTH       = 1920
-HEIGHT      = 1280
-FPS         = 30
-BAYER_PAT   = cv2.COLOR_BayerBG2BGR  # BGGR pattern
+DEVICE        = 5
+WIDTH         = 1920
+HEIGHT        = 1280
+FPS           = 30
+BAYER_PAT     = cv2.COLOR_BayerBG2BGR  # BGGR pattern
+
+# Display at half resolution to reduce NoMachine bandwidth
+DISPLAY_SCALE = 0.5
+DISPLAY_W     = int(WIDTH  * DISPLAY_SCALE)
+DISPLAY_H     = int(HEIGHT * DISPLAY_SCALE)
 # ─────────────────────────────────────────────────────────────────────────────
 
 CTRL_WIN = "White Balance Controls"
@@ -48,28 +52,6 @@ def get_controls():
     return r_gain, g_gain, b_gain, brightness
 
 
-def display_thread(frame_holder, stop_event):
-    """
-    Runs in a separate thread — handles imshow and waitKey independently
-    so it never blocks the capture/GPU pipeline.
-    """
-    while not stop_event.is_set():
-        frame = frame_holder.get('frame')
-        fps   = frame_holder.get('fps', 0.0)
-        if frame is not None:
-            cv2.putText(frame, f"FPS: {fps:.1f}", (20, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.imshow("RAW12 Camera (GPU debayer)", frame)
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            stop_event.set()
-            break
-        elif key == ord('w') and frame is not None:
-            b, g, r = cv2.split(frame)
-            print(f"Channel averages — R: {r.mean():.1f}  G: {g.mean():.1f}  B: {b.mean():.1f}")
-            print(f"Suggested gains  — R: {g.mean()/max(r.mean(),1):.2f}x  B: {g.mean()/max(b.mean(),1):.2f}x")
-
-
 def main():
     cap = open_camera()
     create_controls()
@@ -84,25 +66,15 @@ def main():
     lut_b = np.arange(256, dtype=np.uint8)
 
     stream     = cv2.cuda_Stream()
-    stop_event = threading.Event()
+    prev_gains = (None, None, None, None)
 
-    # Shared dict between capture thread and display thread
-    frame_holder = {'frame': None, 'fps': 0.0}
-
-    # Start display thread
-    disp_thread = threading.Thread(target=display_thread,
-                                   args=(frame_holder, stop_event),
-                                   daemon=True)
-    disp_thread.start()
-
-    print("Press 'q' to quit, 'w' to print channel averages for WB tuning")
+    print("Press 'q' to quit, 'w' for WB suggestions, '+'/'-' to adjust display scale")
 
     frame_count = 0
     fps_display = 0.0
     t0          = time.time()
-    prev_gains  = (None, None, None, None)
 
-    while not stop_event.is_set():
+    while True:
         ret, raw_frame = cap.read()
         if not ret:
             print("Failed to grab frame")
@@ -132,6 +104,9 @@ def main():
         b_ch, g_ch, r_ch = cv2.split(bgr8)
         bgr8 = cv2.merge([cv2.LUT(b_ch, lut_b), cv2.LUT(g_ch, lut_g), cv2.LUT(r_ch, lut_r)])
 
+        # ── Resize for display (reduces NoMachine bandwidth significantly) ────
+        display = cv2.resize(bgr8, (DISPLAY_W, DISPLAY_H), interpolation=cv2.INTER_NEAREST)
+
         # ── FPS counter ───────────────────────────────────────────────────────
         frame_count += 1
         elapsed = time.time() - t0
@@ -140,11 +115,21 @@ def main():
             frame_count = 0
             t0 = time.time()
 
-        # ── Hand frame to display thread (non-blocking) ───────────────────────
-        frame_holder['frame'] = bgr8
-        frame_holder['fps']   = fps_display
+        cv2.putText(display, f"FPS: {fps_display:.1f}", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.putText(display, f"R:{r_gain:.2f} G:{g_gain:.2f} B:{b_gain:.2f}  Bri:{brightness:.2f}",
+                    (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
 
-    stop_event.set()
+        cv2.imshow("RAW12 Camera (GPU debayer)", display)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('w'):
+            b, g, r = cv2.split(bgr8)
+            print(f"Channel averages — R: {r.mean():.1f}  G: {g.mean():.1f}  B: {b.mean():.1f}")
+            print(f"Suggested gains  — R: {g.mean()/max(r.mean(),1):.2f}x  B: {g.mean()/max(b.mean(),1):.2f}x")
+
     cap.release()
     cv2.destroyAllWindows()
 
