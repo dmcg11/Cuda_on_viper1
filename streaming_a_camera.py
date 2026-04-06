@@ -157,13 +157,10 @@ def main():
             prev_gains = gains
 
         # ── CPU: Reinterpret + black level correction ────────────────────────
-        # Sensor outputs 16-bit left-shifted values (12-bit data << 4)
-        # Black level in 16-bit domain is ~1760, which is 110 in 12-bit
-        # Right-shift to 12-bit first, then subtract black level, then clamp
-        raw16 = raw_frame.view(np.uint16).reshape(HEIGHT, WIDTH)
-        np.right_shift(raw16, 4, out=bayer16)   # convert to true 12-bit (0-4095)
-        np.subtract(bayer16, 110, out=bayer16, casting='unsafe')
-        np.clip(bayer16, 0, 4095, out=bayer16)
+        # Sensor outputs 16-bit left-shifted values (12-bit << 4)
+        # Shift right by 4 to get true 12-bit, subtract black level 110, clamp
+        raw16 = raw_frame.view(np.uint16).reshape(HEIGHT, WIDTH).astype(np.int32)
+        bayer16 = np.clip((raw16 >> 4) - 110, 0, 4095).astype(np.uint16)
 
         # ── GPU: Upload → Demosaic ────────────────────────────────────────────
         gpu_bayer.upload(bayer16, stream)
