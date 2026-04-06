@@ -14,9 +14,9 @@ DISPLAY_W     = int(WIDTH  * DISPLAY_SCALE)
 DISPLAY_H     = int(HEIGHT * DISPLAY_SCALE)
 
 # Auto WB update interval in frames
-AWB_INTERVAL  = 30
+AWB_INTERVAL  = 5
 # Smoothing factor — higher = slower/smoother AWB adaptation (0.0-1.0)
-AWB_SMOOTH    = 0.95
+AWB_SMOOTH    = 0.7
 # ─────────────────────────────────────────────────────────────────────────────
 
 CTRL_WIN = "White Balance Controls"
@@ -44,7 +44,7 @@ def create_controls():
     cv2.createTrackbar("R Gain  x100", CTRL_WIN, 100, 400, lambda x: None)
     cv2.createTrackbar("G Gain  x100", CTRL_WIN, 100, 400, lambda x: None)
     cv2.createTrackbar("B Gain  x100", CTRL_WIN, 100, 400, lambda x: None)
-    cv2.createTrackbar("Brightness",   CTRL_WIN,  25, 100, lambda x: None)
+    cv2.createTrackbar("Brightness",   CTRL_WIN,  35, 100, lambda x: None)
     # AWB toggle: 0 = manual, 1 = auto
     cv2.createTrackbar("AWB (0=off)",  CTRL_WIN,   1,   1, lambda x: None)
 
@@ -124,6 +124,7 @@ def main():
 
     # AWB state — start neutral
     awb_r, awb_g, awb_b = 1.0, 1.0, 1.0
+    awb_initialized = False
 
     print("Press 'q' to quit. Toggle AWB slider to switch between auto and manual WB.")
 
