@@ -27,6 +27,7 @@ CTRL_WIN = "Camera Controls"
 def write_reg(bus, addr, reg16, val8):
     reg_hi = (reg16 >> 8) & 0xFF
     reg_lo = reg16 & 0xFF
+    print(f"I2C write: reg=0x{reg16:04X} val=0x{val8:02X}")
     bus.write_i2c_block_data(addr, reg_hi, [reg_lo, val8])
 
 # ── Sensor control ────────────────────────────────────────────────────────────
