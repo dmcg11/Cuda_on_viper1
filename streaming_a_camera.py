@@ -252,7 +252,7 @@ def main():
         cv2.imshow("RAW12 Camera (GPU debayer)", display)
 
         # ── Debug: print dark area pixel values once ────────────────────────
-        if snapshot_saved and not video_saved and len(video_buffer) == 0:
+        if snapshot_saved and not video_saved and len(video_buffer) == 1:
             dark_mean = bgr8[800:1000, 600:800].mean()
             light_mean = bgr8[200:400, 550:750].mean()
             print(f"Dark area mean: {dark_mean:.1f}  Light area mean: {light_mean:.1f}")
