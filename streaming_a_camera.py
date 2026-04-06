@@ -77,8 +77,18 @@ def main():
             print("Failed to grab frame")
             break
 
+        # ── Debug: print buffer size once to check stride ─────────────────────
+        if frame_count == 0:
+            expected = WIDTH * HEIGHT * 3 // 2
+            print(f"Buffer shape: {raw_frame.shape}, size: {raw_frame.size}, expected: {expected}")
+
         # ── CPU: Unpack RAW12 → uint16 Bayer ─────────────────────────────────
         bayer16 = unpack_raw12_packed(raw_frame.tobytes(), WIDTH, HEIGHT)
+
+        # ── CPU: Quick debayer for debug comparison ───────────────────────────
+        bayer8 = (bayer16 >> 4).astype(np.uint8)
+        bgr_cpu = cv2.cvtColor(bayer8, cv2.COLOR_BayerBG2BGR)
+        cv2.imshow("CPU debayer", bgr_cpu)
 
         # ── GPU: Upload ───────────────────────────────────────────────────────
         gpu_bayer.upload(bayer16, stream)
@@ -87,8 +97,7 @@ def main():
         cv2.cuda.demosaicing(gpu_bayer, BAYER_PAT, gpu_bgr16, stream=stream)
 
         # ── GPU: Scale 12-bit (0-4095) → 8-bit (0-255) and convert type ──────
-        # alpha=1/16 divides all values by 16 and converts to 8-bit in one step
-        # args: (type, dst, alpha, beta, stream) — all positional
+        # args: (rtype, alpha, dst, beta)
         gpu_bgr16.convertTo(cv2.CV_8UC3, 1/8, gpu_bgr8, 0)
 
         # ── Download to CPU for display ───────────────────────────────────────
