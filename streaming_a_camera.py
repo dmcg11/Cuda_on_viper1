@@ -87,13 +87,14 @@ def open_camera():
 # ── Controls UI ───────────────────────────────────────────────────────────────
 def create_controls():
     cv2.namedWindow(CTRL_WIN, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(CTRL_WIN, 500, 280)
+    cv2.resizeWindow(CTRL_WIN, 500, 320)
     cv2.createTrackbar("Exposure (rows)", CTRL_WIN,  375, 1118, lambda x: None)
     cv2.createTrackbar("Analog Gain x16", CTRL_WIN,  139,  248, lambda x: None)
     cv2.createTrackbar("AWB R x100",      CTRL_WIN,   82,  800, lambda x: None)
     cv2.createTrackbar("AWB G x100",      CTRL_WIN,  100,  800, lambda x: None)
     cv2.createTrackbar("AWB B x100",      CTRL_WIN,  800,  800, lambda x: None)
     # AWB mode: 0 = manual, 1 = auto
+    cv2.createTrackbar("Brightness",      CTRL_WIN,    0,  100, lambda x: None)
     cv2.createTrackbar("Auto WB (1=on)",  CTRL_WIN,    0,    1, lambda x: None)
 
 def get_controls():
@@ -103,6 +104,7 @@ def get_controls():
         max(cv2.getTrackbarPos("AWB R x100",      CTRL_WIN), 1) / 100.0,
         max(cv2.getTrackbarPos("AWB G x100",      CTRL_WIN), 1) / 100.0,
         max(cv2.getTrackbarPos("AWB B x100",      CTRL_WIN), 1) / 100.0,
+        max(cv2.getTrackbarPos("Brightness",       CTRL_WIN), 1) / 100.0,
         cv2.getTrackbarPos("Auto WB (1=on)",  CTRL_WIN) == 1,
     )
 
@@ -137,8 +139,8 @@ def main():
     bayer16 = np.empty((HEIGHT, WIDTH), dtype=np.uint16)
     stream  = cv2.cuda_Stream()
 
-    prev_controls    = (None,) * 6
-    pending_controls = (None,) * 6
+    prev_controls    = (None,) * 7
+    pending_controls = (None,) * 7
     debounce_count   = 0
     DEBOUNCE_FRAMES  = 3
 
@@ -146,7 +148,7 @@ def main():
     awb_r, awb_g, awb_b = 1.0, 1.0, 1.0
     awb_initialized      = False
 
-    alpha = 1.0
+    alpha = 0.01
     frame_count = fps_display = 0
     t0 = time.time()
 
@@ -158,10 +160,10 @@ def main():
             print("Failed to grab frame")
             break
 
-        exposure, analog_gain, man_r, man_g, man_b, auto_wb = get_controls()
+        exposure, analog_gain, man_r, man_g, man_b, brightness, auto_wb = get_controls()
 
         # ── Debounced I2C writes ──────────────────────────────────────────────
-        controls = (exposure, analog_gain, man_r, man_g, man_b, auto_wb)
+        controls = (exposure, analog_gain, man_r, man_g, man_b, brightness, auto_wb)
         if controls != pending_controls:
             pending_controls = controls
             debounce_count   = 0
@@ -177,7 +179,7 @@ def main():
                     set_awb_gain(bus, man_r, man_g, man_b)
             except Exception as e:
                 print(f"I2C error: {e}")
-            alpha         = 1.0
+            alpha         = brightness
             prev_controls = controls
 
         # ── CPU: reinterpret ──────────────────────────────────────────────────
