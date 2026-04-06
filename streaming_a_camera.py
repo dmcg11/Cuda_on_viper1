@@ -43,7 +43,8 @@ def set_analog_gain(bus, gain_x16):
 
 def set_awb_gain(bus, r_gain, g_gain, b_gain):
     def encode(gain):
-        val = max(1024, min(int(gain * 1024), 0x7FFF))
+        # 5.10 bit format, minimum is 0 (not 1024) — gains below 1x are valid
+        val = max(0, min(int(gain * 1024), 0x7FFF))
         return (val >> 8) & 0x7F, val & 0xFF
     b_hi, b_lo = encode(b_gain)
     g_hi, g_lo = encode(g_gain)
@@ -155,9 +156,14 @@ def main():
 
     print("Press 'q' to quit, 's' to save snapshot manually")
 
-    SNAPSHOT_DELAY = 5.0   # seconds after start before auto-saving
-    snapshot_saved = False
-    start_time     = time.time()
+    SNAPSHOT_DELAY  = 5.0   # seconds after start before auto-saving
+    snapshot_saved  = False
+    start_time      = time.time()
+
+    # Video capture — record 15 frames starting at 5 second mark
+    VIDEO_FRAMES    = 15
+    video_buffer    = []
+    video_saved     = False
 
     while True:
         ret, raw_frame = cap.read()
@@ -243,12 +249,25 @@ def main():
         cv2.namedWindow("RAW12 Camera (GPU debayer)", cv2.WINDOW_NORMAL)
         cv2.imshow("RAW12 Camera (GPU debayer)", display)
 
-        # ── Auto snapshot 5 seconds after start ──────────────────────────────
+        # ── Auto snapshot + video clip 5 seconds after start ────────────────
         if not snapshot_saved and (time.time() - start_time) >= SNAPSHOT_DELAY:
             snapshot_path = "/tmp/camera_snapshot.jpg"
             cv2.imwrite(snapshot_path, bgr8, [cv2.IMWRITE_JPEG_QUALITY, 95])
             print(f"Auto snapshot saved: {snapshot_path}")
             snapshot_saved = True
+
+        # Collect frames for video clip starting at 5s mark
+        if snapshot_saved and not video_saved:
+            video_buffer.append(bgr8.copy())
+            if len(video_buffer) >= VIDEO_FRAMES:
+                video_path = "/tmp/camera_clip.mp4"
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                out = cv2.VideoWriter(video_path, fourcc, 10, (WIDTH, HEIGHT))
+                for f in video_buffer:
+                    out.write(f)
+                out.release()
+                print(f"Video clip saved: {video_path} ({VIDEO_FRAMES} frames)")
+                video_saved = True
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
