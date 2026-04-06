@@ -10,29 +10,13 @@ FPS         = 30
 BAYER_PAT   = cv2.COLOR_BayerBG2BGR  # BGGR pattern
 # ─────────────────────────────────────────────────────────────────────────────
 
-def unpack_raw12_packed(raw_bytes, width, height):
+def unpack_raw12_unpacked(raw_bytes, width, height):
     """
-    Unpack packed RAW12 (2 pixels in 3 bytes) to uint16 array.
-    Byte layout: [P0_high8, P1_high8, P1_low4|P0_low4]
+    Unpacked RAW12 — each pixel stored in 2 bytes (uint16, little-endian).
+    No bit manipulation needed, just reinterpret and reshape.
     """
-    raw = np.frombuffer(raw_bytes, dtype=np.uint8)
-
-    expected = width * height * 3 // 2
-    if len(raw) < expected:
-        raise ValueError(f"Buffer too small: got {len(raw)}, expected {expected}")
-
-    raw = raw[:expected].reshape(-1, 3)
-
-    # Extract 12-bit pixels
-    p0 = (raw[:, 0].astype(np.uint16) << 4) | ((raw[:, 2] >> 4) & 0x0F)
-    p1 = (raw[:, 1].astype(np.uint16) << 4) | (raw[:, 2] & 0x0F)
-
-    # Interleave and reshape to image
-    unpacked = np.empty(width * height, dtype=np.uint16)
-    unpacked[0::2] = p0
-    unpacked[1::2] = p1
-
-    return unpacked.reshape(height, width)
+    raw = np.frombuffer(raw_bytes, dtype=np.uint16)
+    return raw.reshape(height, width)
 
 
 def open_camera():
@@ -77,18 +61,8 @@ def main():
             print("Failed to grab frame")
             break
 
-        # ── Debug: print buffer size once to check stride ─────────────────────
-        if frame_count == 0:
-            expected = WIDTH * HEIGHT * 3 // 2
-            print(f"Buffer shape: {raw_frame.shape}, size: {raw_frame.size}, expected: {expected}")
-
-        # ── CPU: Unpack RAW12 → uint16 Bayer ─────────────────────────────────
-        bayer16 = unpack_raw12_packed(raw_frame.tobytes(), WIDTH, HEIGHT)
-
-        # ── CPU: Quick debayer for debug comparison ───────────────────────────
-        bayer8 = (bayer16 >> 4).astype(np.uint8)
-        bgr_cpu = cv2.cvtColor(bayer8, cv2.COLOR_BayerBG2BGR)
-        cv2.imshow("CPU debayer", bgr_cpu)
+        # ── CPU: Reinterpret buffer as uint16 Bayer ───────────────────────────
+        bayer16 = unpack_raw12_unpacked(raw_frame.tobytes(), WIDTH, HEIGHT)
 
         # ── GPU: Upload ───────────────────────────────────────────────────────
         gpu_bayer.upload(bayer16, stream)
@@ -96,9 +70,9 @@ def main():
         # ── GPU: Demosaic BGGR Bayer → BGR 16-bit ────────────────────────────
         cv2.cuda.demosaicing(gpu_bayer, BAYER_PAT, gpu_bgr16, stream=stream)
 
-        # ── GPU: Scale 12-bit (0-4095) → 8-bit (0-255) and convert type ──────
+        # ── GPU: Scale to 8-bit (alpha=1/16 maps 12-bit range to 8-bit) ──────
         # args: (rtype, alpha, dst, beta)
-        gpu_bgr16.convertTo(cv2.CV_8UC3, 1/8, gpu_bgr8, 0)
+        gpu_bgr16.convertTo(cv2.CV_8UC3, 1/16, gpu_bgr8, 0)
 
         # ── Download to CPU for display ───────────────────────────────────────
         stream.waitForCompletion()
