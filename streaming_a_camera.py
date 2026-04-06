@@ -10,20 +10,11 @@ FPS         = 30
 BAYER_PAT   = cv2.COLOR_BayerBG2BGR  # BGGR pattern
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Trackbar window name
 CTRL_WIN = "White Balance Controls"
 
 def unpack_raw12_unpacked(raw_bytes, width, height):
     raw = np.frombuffer(raw_bytes, dtype=np.uint16)
     return raw.reshape(height, width)
-
-
-def apply_white_balance(bgr8, r_gain, g_gain, b_gain):
-    b, g, r = cv2.split(bgr8)
-    r = np.clip(r.astype(np.float32) * r_gain, 0, 255).astype(np.uint8)
-    g = np.clip(g.astype(np.float32) * g_gain, 0, 255).astype(np.uint8)
-    b = np.clip(b.astype(np.float32) * b_gain, 0, 255).astype(np.uint8)
-    return cv2.merge([b, g, r])
 
 
 def open_camera():
@@ -45,19 +36,12 @@ def open_camera():
 
 
 def create_controls():
-    """Create a separate window with trackbars for WB and brightness control."""
     cv2.namedWindow(CTRL_WIN, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(CTRL_WIN, 500, 200)
-
-    # Gains stored as integers 0–400, divide by 100 to get float (0.0–4.0)
-    # Default: R=160 (1.6x), G=100 (1.0x), B=140 (1.4x)
     cv2.createTrackbar("R Gain  x100", CTRL_WIN, 160, 400, lambda x: None)
     cv2.createTrackbar("G Gain  x100", CTRL_WIN, 100, 400, lambda x: None)
     cv2.createTrackbar("B Gain  x100", CTRL_WIN, 140, 400, lambda x: None)
-
-    # Brightness: stored as 1–100, maps to alpha 1/100 – 1/1
-    # Default: 25 → alpha = 1/4 (same as before)
-    cv2.createTrackbar("Brightness", CTRL_WIN,  25, 100, lambda x: None)
+    cv2.createTrackbar("Brightness",   CTRL_WIN,  25, 100, lambda x: None)
 
 
 def get_controls():
@@ -73,9 +57,15 @@ def main():
     create_controls()
 
     # Pre-allocate GPU mats
-    gpu_bayer  = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_16UC1)
-    gpu_bgr16  = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_16UC3)
-    gpu_bgr8   = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC3)
+    gpu_bayer   = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_16UC1)
+    gpu_bgr16   = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_16UC3)
+    gpu_bgr8    = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC3)
+
+    # Per-channel GPU mats for white balance (8-bit single channel)
+    gpu_b       = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC1)
+    gpu_g       = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC1)
+    gpu_r       = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC1)
+    gpu_wb      = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC3)
 
     stream = cv2.cuda_Stream()
 
@@ -91,7 +81,6 @@ def main():
             print("Failed to grab frame")
             break
 
-        # Read controls every frame
         r_gain, g_gain, b_gain, brightness = get_controls()
 
         # ── CPU: Reinterpret buffer as uint16 Bayer ───────────────────────────
@@ -102,10 +91,16 @@ def main():
         cv2.cuda.demosaicing(gpu_bayer, BAYER_PAT, gpu_bgr16, stream=stream)
         gpu_bgr16.convertTo(cv2.CV_8UC3, brightness, gpu_bgr8, 0)
 
-        # ── Download and apply white balance ──────────────────────────────────
+        # ── GPU: White balance — split, scale each channel, merge ─────────────
+        cv2.cuda.split(gpu_bgr8, [gpu_b, gpu_g, gpu_r], stream=stream)
+        cv2.cuda.multiply(gpu_b, b_gain, gpu_b, stream=stream)
+        cv2.cuda.multiply(gpu_g, g_gain, gpu_g, stream=stream)
+        cv2.cuda.multiply(gpu_r, r_gain, gpu_r, stream=stream)
+        cv2.cuda.merge([gpu_b, gpu_g, gpu_r], gpu_wb, stream=stream)
+
+        # ── Download ──────────────────────────────────────────────────────────
         stream.waitForCompletion()
-        bgr8 = gpu_bgr8.download()
-        bgr8 = apply_white_balance(bgr8, r_gain, g_gain, b_gain)
+        bgr8 = gpu_wb.download()
 
         # ── FPS counter ───────────────────────────────────────────────────────
         frame_count += 1
