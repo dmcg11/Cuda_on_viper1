@@ -57,15 +57,18 @@ def main():
     create_controls()
 
     # Pre-allocate GPU mats
-    gpu_bayer   = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_16UC1)
-    gpu_bgr16   = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_16UC3)
-    gpu_bgr8    = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC3)
+    gpu_bayer  = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_16UC1)
+    gpu_bgr16  = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_16UC3)
+    gpu_bgr8   = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC3)
 
-    # Per-channel GPU mats for white balance (8-bit single channel)
-    gpu_b       = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC1)
-    gpu_g       = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC1)
-    gpu_r       = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC1)
-    gpu_wb      = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC3)
+    # Per-channel GPU mats for white balance
+    gpu_b      = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC1)
+    gpu_g      = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC1)
+    gpu_r      = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC1)
+    gpu_b_wb   = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC1)
+    gpu_g_wb   = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC1)
+    gpu_r_wb   = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC1)
+    gpu_wb     = cv2.cuda_GpuMat(HEIGHT, WIDTH, cv2.CV_8UC3)
 
     stream = cv2.cuda_Stream()
 
@@ -92,11 +95,12 @@ def main():
         gpu_bgr16.convertTo(cv2.CV_8UC3, brightness, gpu_bgr8, 0)
 
         # ── GPU: White balance — split, scale each channel, merge ─────────────
+        # convertTo(rtype, alpha, dst, beta) scales and clips to uint8 range
         cv2.cuda.split(gpu_bgr8, [gpu_b, gpu_g, gpu_r], stream=stream)
-        cv2.cuda.multiply(gpu_b, b_gain, gpu_b, stream=stream)
-        cv2.cuda.multiply(gpu_g, g_gain, gpu_g, stream=stream)
-        cv2.cuda.multiply(gpu_r, r_gain, gpu_r, stream=stream)
-        cv2.cuda.merge([gpu_b, gpu_g, gpu_r], gpu_wb, stream=stream)
+        gpu_b.convertTo(cv2.CV_8UC1, b_gain, gpu_b_wb, 0)
+        gpu_g.convertTo(cv2.CV_8UC1, g_gain, gpu_g_wb, 0)
+        gpu_r.convertTo(cv2.CV_8UC1, r_gain, gpu_r_wb, 0)
+        cv2.cuda.merge([gpu_b_wb, gpu_g_wb, gpu_r_wb], gpu_wb, stream=stream)
 
         # ── Download ──────────────────────────────────────────────────────────
         stream.waitForCompletion()
