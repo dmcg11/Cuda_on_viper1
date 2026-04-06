@@ -24,8 +24,8 @@ def unpack_raw12_packed(raw_bytes, width, height):
     raw = raw[:expected].reshape(-1, 3)
 
     # Extract 12-bit pixels
-    p0 = (raw[:, 0].astype(np.uint16) << 4) | (raw[:, 2] & 0x0F)
-    p1 = (raw[:, 1].astype(np.uint16) << 4) | ((raw[:, 2] >> 4) & 0x0F)
+    p0 = (raw[:, 0].astype(np.uint16) << 4) | ((raw[:, 2] >> 4) & 0x0F)
+    p1 = (raw[:, 1].astype(np.uint16) << 4) | (raw[:, 2] & 0x0F)
 
     # Interleave and reshape to image
     unpacked = np.empty(width * height, dtype=np.uint16)
@@ -89,8 +89,7 @@ def main():
         # ── GPU: Scale 12-bit (0-4095) → 8-bit (0-255) and convert type ──────
         # alpha=1/16 divides all values by 16 and converts to 8-bit in one step
         # args: (type, dst, alpha, beta, stream) — all positional
-        gpu_bgr16.convertTo(cv2.CV_8UC3, 1/16, gpu_bgr8, 0)
-
+        gpu_bgr16.convertTo(cv2.CV_8UC3, 1/8, gpu_bgr8, 0)
 
         # ── Download to CPU for display ───────────────────────────────────────
         stream.waitForCompletion()
