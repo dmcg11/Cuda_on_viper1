@@ -341,13 +341,11 @@ def create_controls():
     cv2.namedWindow(CTRL_WIN, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(CTRL_WIN, 520, 580)
 
-    cv2.createTrackbar("── AWB ──────────────",  CTRL_WIN, 0, 0, lambda x: None)
     cv2.createTrackbar("Auto WB  (1=on)",        CTRL_WIN, 1, 1, lambda x: None)
     cv2.createTrackbar("AWB R x100",             CTRL_WIN, 110, 400, lambda x: None)
     cv2.createTrackbar("AWB G x100",             CTRL_WIN, 100, 400, lambda x: None)
     cv2.createTrackbar("AWB B x100",             CTRL_WIN,  85, 400, lambda x: None)
 
-    cv2.createTrackbar("── Pipeline ─────────", CTRL_WIN, 0, 0, lambda x: None)
     cv2.createTrackbar("Black Level",            CTRL_WIN, BAYER_BLACK_LEVEL, 64, lambda x: None)
     cv2.createTrackbar("CCM Strength x100",      CTRL_WIN, 100, 100, lambda x: None)
     cv2.createTrackbar("Gamma x100",             CTRL_WIN, 220, 400, lambda x: None)
@@ -355,7 +353,6 @@ def create_controls():
     cv2.createTrackbar("Sharpness x100",         CTRL_WIN,  50, 200, lambda x: None)
     cv2.createTrackbar("Denoise (1=on)",         CTRL_WIN,   0,   1, lambda x: None)
 
-    cv2.createTrackbar("── AEC ──────────────", CTRL_WIN, 0, 0, lambda x: None)
     cv2.createTrackbar("Auto Exp (1=on)",        CTRL_WIN, 1, 1, lambda x: None)
     cv2.createTrackbar("AE Target",              CTRL_WIN, 120, 255, lambda x: None)
 
