@@ -255,12 +255,14 @@ def debayer(raw):
     return cv2.cvtColor(raw, cv2.COLOR_BayerRG2BGR)
 
 
-# IMX219 has a known green dominance in RAW8 mode.
-# These per-channel offsets correct the sensor's native channel imbalance
-# before AWB runs.  Tweak if your unit differs.
-IMX219_CCM_R = 1.45   # red is typically weak on IMX219 RAW8
+# IMX219 per-channel correction offsets.
+# Calibrated from neutral patch analysis of snapshot.jpg:
+#   Raw channel means: B=128  G=125  R=136
+#   Neutral patches showed blue overcorrected, red slightly high.
+# Tweak IMX219_CCM_R/B if your lighting or unit differs.
+IMX219_CCM_R = 1.10   # slight red boost for warm color accuracy
 IMX219_CCM_G = 1.00   # green is reference
-IMX219_CCM_B = 1.25   # blue is moderately weak
+IMX219_CCM_B = 0.85   # pull blue back — was overcorrected
 
 def gray_world_gains(bgr):
     """
@@ -451,7 +453,7 @@ def _parse():
     p.add_argument("--device",   default="/dev/video5")
     p.add_argument("--i2c-bus",  type=int, default=1)
     p.add_argument("--i2c-addr", type=lambda x: int(x, 0), default=0x10,
-                   help="Sensor I2C address (default 0x08 from 'cam_v1 1-0008')")
+                   help="Sensor I2C address (default 0x10)")
     p.add_argument("--width",    type=int, default=1920)
     p.add_argument("--height",   type=int, default=1080)
     p.add_argument("--target-brightness", type=float, default=120.0)
