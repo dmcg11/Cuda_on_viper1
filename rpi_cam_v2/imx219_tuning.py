@@ -358,6 +358,54 @@ class AEController:
 
 
 # ==============================================================================
+# Controls GUI
+# ==============================================================================
+CTRL_WIN = "IMX219 Controls"
+
+def create_controls(args):
+    cv2.namedWindow(CTRL_WIN, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(CTRL_WIN, 500, 420)
+
+    # AWB auto/manual toggle
+    cv2.createTrackbar("Auto WB  (1=on)",  CTRL_WIN, 0 if args.no_awb else 1, 1, lambda x: None)
+
+    # Manual AWB gains  ×100 so slider is integer (100 = 1.00×)
+    # Initialise from the CCM defaults
+    cv2.createTrackbar("AWB R x100", CTRL_WIN,
+                       int(IMX219_CCM_R * 100), 400, lambda x: None)
+    cv2.createTrackbar("AWB G x100", CTRL_WIN, 100, 400, lambda x: None)
+    cv2.createTrackbar("AWB B x100", CTRL_WIN,
+                       int(IMX219_CCM_B * 100), 400, lambda x: None)
+
+    # Black level (pedestal)  default 16 for RAW8
+    cv2.createTrackbar("Black Level", CTRL_WIN, BAYER_BLACK_LEVEL, 64, lambda x: None)
+
+    # Brightness / AE target
+    cv2.createTrackbar("AE Target",  CTRL_WIN, int(args.target_brightness), 255, lambda x: None)
+
+    # AEC on/off
+    cv2.createTrackbar("Auto Exp (1=on)", CTRL_WIN, 0 if args.no_aec else 1, 1, lambda x: None)
+
+
+def get_controls():
+    auto_wb  = cv2.getTrackbarPos("Auto WB  (1=on)",  CTRL_WIN) == 1
+    r_gain   = max(cv2.getTrackbarPos("AWB R x100", CTRL_WIN), 1) / 100.0
+    g_gain   = max(cv2.getTrackbarPos("AWB G x100", CTRL_WIN), 1) / 100.0
+    b_gain   = max(cv2.getTrackbarPos("AWB B x100", CTRL_WIN), 1) / 100.0
+    bl       = cv2.getTrackbarPos("Black Level", CTRL_WIN)
+    ae_tgt   = max(cv2.getTrackbarPos("AE Target",  CTRL_WIN), 1)
+    auto_aec = cv2.getTrackbarPos("Auto Exp (1=on)", CTRL_WIN) == 1
+    return auto_wb, r_gain, g_gain, b_gain, bl, ae_tgt, auto_aec
+
+
+def sync_awb_sliders(gr, gg, gb):
+    """Push computed AWB gains back into the sliders so the user can see them."""
+    cv2.setTrackbarPos("AWB R x100", CTRL_WIN, int(np.clip(gr * 100, 1, 400)))
+    cv2.setTrackbarPos("AWB G x100", CTRL_WIN, int(np.clip(gg * 100, 1, 400)))
+    cv2.setTrackbarPos("AWB B x100", CTRL_WIN, int(np.clip(gb * 100, 1, 400)))
+
+
+# ==============================================================================
 # Main loop
 # ==============================================================================
 def run(args):
@@ -368,13 +416,16 @@ def run(args):
     ctrl = IMX219Controller(i2c)
     ae   = AEController(target=args.target_brightness)
 
-    awb       = [1.0, 1.0, 1.0]   # [gr, gg, gb]
+    create_controls(args)
+
+    # AWB EMA state — initialise from CCM defaults
+    awb       = [IMX219_CCM_R, 1.0, IMX219_CCM_B]
     alpha     = 0.05
     frame_n   = 0
     save_next = False
 
-    print("\nKeys (window must have focus):")
-    print("  q/ESC quit  |  r reset  |  s save frame  |  p print state\n")
+    print("\nKeys (camera window must have focus):")
+    print("  q/ESC quit  |  r reset  |  s save snapshot.jpg  |  p print state\n")
 
     while True:
         raw = cap.read()
@@ -382,18 +433,30 @@ def run(args):
             continue
         frame_n += 1
 
-        raw_bl = subtract_black(raw)
+        # Read controls every frame
+        auto_wb, man_r, man_g, man_b, bl, ae_tgt, auto_aec = get_controls()
+        ae.target = ae_tgt
+
+        raw_bl = subtract_black(raw, bl)
         bgr    = debayer(raw_bl)
 
-        if not args.no_aec:
+        # ── AEC/AGC ──────────────────────────────────────────────────────
+        if auto_aec:
             brt = ae.measure(bgr)
             ae.step(brt, ctrl)
 
-        if not args.no_awb and frame_n % 5 == 0:
+        # ── AWB ──────────────────────────────────────────────────────────
+        if auto_wb and frame_n % 5 == 0:
             gr, gg, gb = gray_world_gains(bgr)
             awb[0] = alpha * gr + (1 - alpha) * awb[0]
             awb[1] = 1.0
             awb[2] = alpha * gb + (1 - alpha) * awb[2]
+            sync_awb_sliders(*awb)
+        elif not auto_wb:
+            # Manual: use slider values directly
+            awb[0] = man_r
+            awb[1] = man_g
+            awb[2] = man_b
 
         bgr_wb = apply_gains(bgr, *awb)
 
@@ -403,15 +466,18 @@ def run(args):
             print("[SAVE] snapshot.jpg")
             save_next = False
 
+        # ── OSD ──────────────────────────────────────────────────────────
         disp = bgr_wb.copy()
         brt  = ae.measure(disp)
+        wb_mode = "AUTO" if auto_wb else "MANUAL"
         osd  = [
             f"Frame {frame_n}",
-            f"Brightness: {brt:.1f} / target {args.target_brightness}",
+            f"Brightness: {brt:.1f} / target {ae_tgt}",
             f"AnaGain : {ctrl.analog_gain:.2f}x  (code {ctrl.ana_code})",
             f"DigGain : {ctrl.digital_gain:.2f}x  (0x{ctrl.dig_code:04X})",
             f"Exposure: {ctrl.exposure_us:.0f} us  ({ctrl.exposure_lines} lines)",
-            f"AWB  R={awb[0]:.3f}  G={awb[1]:.3f}  B={awb[2]:.3f}",
+            f"AWB [{wb_mode}]  R={awb[0]:.3f}  G={awb[1]:.3f}  B={awb[2]:.3f}",
+            f"Black level: {bl}",
         ]
         for i, t in enumerate(osd):
             cv2.putText(disp, t, (10, 22 + i * 22),
@@ -430,14 +496,17 @@ def run(args):
             break
         elif key == ord('r'):
             ctrl.reset()
-            awb[:] = [1.0, 1.0, 1.0]
+            awb[:] = [IMX219_CCM_R, 1.0, IMX219_CCM_B]
+            sync_awb_sliders(*awb)
+            cv2.setTrackbarPos("Black Level", CTRL_WIN, BAYER_BLACK_LEVEL)
             print("[RESET]")
         elif key == ord('s'):
             save_next = True
         elif key == ord('p'):
             ctrl.print_state()
-            print(f"  AWB  R={awb[0]:.3f}  G={awb[1]:.3f}  B={awb[2]:.3f}")
-            print(f"  Brightness: {ae.measure(bgr):.1f}")
+            print(f"  AWB [{wb_mode}]  R={awb[0]:.3f}  G={awb[1]:.3f}  B={awb[2]:.3f}")
+            print(f"  Black level : {bl}")
+            print(f"  Brightness  : {ae.measure(bgr):.1f}")
 
     cap.release()
     cv2.destroyAllWindows()
