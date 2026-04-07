@@ -282,7 +282,7 @@ def main():
             break
         elif key == ord('s'):
             snapshot_path = "/tmp/camera_snapshot.jpg"
-            cv2.imwrite(snapshot_path, bgr8, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            cv2.imwrite(snapshot_path, bgr8, [cv2.IMWRITE_JPEG_QUALITY, 95]) #
             print(f"Manual snapshot saved: {snapshot_path}")
 
     if bus:
