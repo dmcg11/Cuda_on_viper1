@@ -450,7 +450,7 @@ def _parse():
     p = argparse.ArgumentParser(description="IMX219 RAW8 tuning - Jetson/Tegra VI")
     p.add_argument("--device",   default="/dev/video5")
     p.add_argument("--i2c-bus",  type=int, default=1)
-    p.add_argument("--i2c-addr", type=lambda x: int(x, 0), default=0x08,
+    p.add_argument("--i2c-addr", type=lambda x: int(x, 0), default=0x10,
                    help="Sensor I2C address (default 0x08 from 'cam_v1 1-0008')")
     p.add_argument("--width",    type=int, default=1920)
     p.add_argument("--height",   type=int, default=1080)
