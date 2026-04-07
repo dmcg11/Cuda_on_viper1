@@ -123,7 +123,7 @@ REG_EXPOSURE_HI  = 0x015A
 REG_EXPOSURE_LO  = 0x015B
 EXPOSURE_MIN     = 4
 EXPOSURE_MAX     = 65535
-EXPOSURE_DEFAULT = 0x0640
+EXPOSURE_DEFAULT = 0x0A00   # raised from 0x640 — IMX219 RAW8 tends to underexpose
 
 BAYER_BLACK_LEVEL = 16    # RAW8 pedestal  (native 10-bit 64 >> 2)
 BAYER_WHITE_LEVEL = 255
@@ -255,12 +255,46 @@ def debayer(raw):
     return cv2.cvtColor(raw, cv2.COLOR_BayerRG2BGR)
 
 
+# IMX219 has a known green dominance in RAW8 mode.
+# These per-channel offsets correct the sensor's native channel imbalance
+# before AWB runs.  Tweak if your unit differs.
+IMX219_CCM_R = 1.45   # red is typically weak on IMX219 RAW8
+IMX219_CCM_G = 1.00   # green is reference
+IMX219_CCM_B = 1.25   # blue is moderately weak
+
 def gray_world_gains(bgr):
-    b  = bgr[:, :, 0].astype(np.float32)
-    g  = bgr[:, :, 1].astype(np.float32)
-    r  = bgr[:, :, 2].astype(np.float32)
-    mg = np.mean(g) + 1e-6
-    return mg / (np.mean(r) + 1e-6), 1.0, mg / (np.mean(b) + 1e-6)
+    """
+    AWB using neutral pixels only (pixels where R~G~B within a threshold).
+    Falls back to full gray-world if not enough neutral pixels are found.
+    Also applies IMX219 channel correction offsets on top.
+    """
+    b = bgr[:, :, 0].astype(np.float32)
+    g = bgr[:, :, 1].astype(np.float32)
+    r = bgr[:, :, 2].astype(np.float32)
+
+    # Find neutral pixels: low saturation, mid-brightness
+    gray  = (r + g + b) / 3.0
+    diff  = np.maximum(np.maximum(np.abs(r - gray),
+                                   np.abs(g - gray)),
+                                   np.abs(b - gray))
+    mask  = (diff < 20) & (gray > 30) & (gray < 230)
+
+    if mask.sum() > 500:
+        r_avg = float(r[mask].mean()) + 1e-6
+        g_avg = float(g[mask].mean()) + 1e-6
+        b_avg = float(b[mask].mean()) + 1e-6
+    else:
+        # fallback: full frame gray world
+        r_avg = float(r.mean()) + 1e-6
+        g_avg = float(g.mean()) + 1e-6
+        b_avg = float(b.mean()) + 1e-6
+
+    # Neutral balance relative to green
+    gr = (g_avg / r_avg) * IMX219_CCM_R
+    gg = 1.0
+    gb = (g_avg / b_avg) * IMX219_CCM_B
+
+    return float(np.clip(gr, 0.5, 4.0)), gg, float(np.clip(gb, 0.5, 4.0))
 
 
 def apply_gains(bgr, gr, gg, gb):
@@ -355,17 +389,16 @@ def run(args):
 
         if not args.no_awb and frame_n % 5 == 0:
             gr, gg, gb = gray_world_gains(bgr)
-            gr = float(np.clip(gr, 0.5, 3.0))
-            gb = float(np.clip(gb, 0.5, 3.0))
             awb[0] = alpha * gr + (1 - alpha) * awb[0]
+            awb[1] = 1.0
             awb[2] = alpha * gb + (1 - alpha) * awb[2]
 
         bgr_wb = apply_gains(bgr, *awb)
 
         if save_next:
-            fname = f"imx219_{frame_n:05d}.png"
-            cv2.imwrite(fname, bgr_wb)
-            print(f"[SAVE] {fname}")
+            cv2.imwrite("snapshot.jpg", bgr_wb,
+                        [cv2.IMWRITE_JPEG_QUALITY, 95])
+            print("[SAVE] snapshot.jpg")
             save_next = False
 
         disp = bgr_wb.copy()
@@ -417,11 +450,11 @@ def _parse():
     p = argparse.ArgumentParser(description="IMX219 RAW8 tuning - Jetson/Tegra VI")
     p.add_argument("--device",   default="/dev/video5")
     p.add_argument("--i2c-bus",  type=int, default=1)
-    p.add_argument("--i2c-addr", type=lambda x: int(x, 0), default=0x10,
+    p.add_argument("--i2c-addr", type=lambda x: int(x, 0), default=0x08,
                    help="Sensor I2C address (default 0x08 from 'cam_v1 1-0008')")
     p.add_argument("--width",    type=int, default=1920)
     p.add_argument("--height",   type=int, default=1080)
-    p.add_argument("--target-brightness", type=float, default=100.0)
+    p.add_argument("--target-brightness", type=float, default=120.0)
     p.add_argument("--no-awb",   action="store_true")
     p.add_argument("--no-aec",   action="store_true")
     return p.parse_args()
