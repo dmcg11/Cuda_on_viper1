@@ -143,11 +143,15 @@ class IMX219I2C:
         self._verify()
 
     def _verify(self):
-        hi  = self._read8(0x0000)
-        lo  = self._read8(0x0001)
-        cid = (hi << 8) | lo
-        ok  = "OK" if cid == 0x0219 else "UNEXPECTED - check --i2c-addr"
-        print(f"[I2C] Chip ID 0x{cid:04X}  {ok}")
+        try:
+            hi  = self._read8(0x0000)
+            lo  = self._read8(0x0001)
+            cid = (hi << 8) | lo
+            ok  = "OK" if cid == 0x0219 else "UNEXPECTED - check --i2c-addr"
+            print(f"[I2C] Chip ID 0x{cid:04X}  {ok}")
+        except OSError as e:
+            print(f"[I2C] Chip ID read failed ({e}) - "
+                  f"continuing anyway (writes may still work)")
 
     def _read8(self, reg):
         if self._bus is None:
@@ -160,9 +164,12 @@ class IMX219I2C:
     def write8(self, reg, val):
         if self._bus is None:
             return
-        msg = smbus2.i2c_msg.write(
-            self._addr, [(reg >> 8) & 0xFF, reg & 0xFF, val & 0xFF])
-        self._bus.i2c_rdwr(msg)
+        try:
+            msg = smbus2.i2c_msg.write(
+                self._addr, [(reg >> 8) & 0xFF, reg & 0xFF, val & 0xFF])
+            self._bus.i2c_rdwr(msg)
+        except OSError as e:
+            print(f"[I2C] Write reg=0x{reg:04X} val=0x{val:02X} failed: {e}")
 
     def close(self):
         if self._bus is not None:
@@ -410,7 +417,7 @@ def _parse():
     p = argparse.ArgumentParser(description="IMX219 RAW8 tuning - Jetson/Tegra VI")
     p.add_argument("--device",   default="/dev/video5")
     p.add_argument("--i2c-bus",  type=int, default=1)
-    p.add_argument("--i2c-addr", type=lambda x: int(x, 0), default=0x08,
+    p.add_argument("--i2c-addr", type=lambda x: int(x, 0), default=0x10,
                    help="Sensor I2C address (default 0x08 from 'cam_v1 1-0008')")
     p.add_argument("--width",    type=int, default=1920)
     p.add_argument("--height",   type=int, default=1080)
