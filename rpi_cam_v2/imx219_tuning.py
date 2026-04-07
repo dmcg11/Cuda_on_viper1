@@ -219,114 +219,97 @@ class AEController:
 
 
 # ==============================================================================
-# ISP Pipeline
+# ISP Pipeline  (optimised for real-time)
 # ==============================================================================
 
-# ── Color Correction Matrix ───────────────────────────────────────────────────
-# From Raspberry Pi libcamera IMX219 tuning file (D65 daylight).
-# Applied in LINEAR space (before gamma). Rows = output BGR, Cols = input BGR.
-# This maps the sensor's native Bayer color space to sRGB.
+# RPi libcamera IMX219 CCM (D65). Applied in LINEAR space before gamma.
 CCM_DEFAULT = np.array([
-    [ 1.8004, -0.5760, -0.2244],   # output B
-    [-0.3566,  1.6925, -0.3359],   # output G
-    [-0.0950, -0.6687,  1.7637],   # output R
+    [ 1.8004, -0.5760, -0.2244],
+    [-0.3566,  1.6925, -0.3359],
+    [-0.0950, -0.6687,  1.7637],
 ], dtype=np.float32)
 
-# ── Gamma LUT ─────────────────────────────────────────────────────────────────
-def build_gamma_lut(gamma: float) -> np.ndarray:
-    """Build a uint8->uint8 LUT for power-law gamma correction."""
-    x = np.arange(256, dtype=np.float32) / 255.0
-    y = np.power(np.clip(x, 1e-6, 1.0), 1.0 / gamma)
-    return (y * 255.0).astype(np.uint8)
+# Cached pipeline state — recomputed only when params change
+_cache = {'gamma': -1.0, 'gamma_lut': None, 'ccm_key': None, 'ccm_m34': None}
 
+def _get_gamma_lut(gamma):
+    if gamma != _cache['gamma']:
+        x = np.arange(256, dtype=np.float32) / 255.0
+        _cache['gamma_lut'] = (np.power(np.clip(x, 1e-6, 1.0), 1.0/gamma)*255).astype(np.uint8)
+        _cache['gamma'] = gamma
+    return _cache['gamma_lut']
 
-# ── AWB neutral-pixel estimate ────────────────────────────────────────────────
-def gray_world_gains(bgr: np.ndarray):
-    """Neutral-pixel AWB in linear space."""
-    b = bgr[:,:,0].astype(np.float32)
-    g = bgr[:,:,1].astype(np.float32)
-    r = bgr[:,:,2].astype(np.float32)
+def _get_ccm_m34(awb, ccm_s, bl):
+    """
+    Merge black-level offset + AWB diagonal + CCM into one (3,4) matrix
+    for a single cv2.transform() call:
+        dst = src_float @ M3x3.T  +  offset
+    where src_float values are in [0,255] uint8 space.
+    """
+    key = (round(awb[0],4), round(awb[1],4), round(awb[2],4), round(ccm_s,4), bl)
+    if key == _cache['ccm_key']:
+        return _cache['ccm_m34']
+    scale    = 1.0 / (255.0 - bl)
+    awb_d    = np.diag([awb[2], awb[1], awb[0]]).astype(np.float32)  # BGR order
+    ccm      = ccm_s * CCM_DEFAULT + (1.0-ccm_s) * np.eye(3, dtype=np.float32)
+    M        = ccm @ awb_d * scale          # (3,3): combined gain+CCM per input channel
+    bias     = -bl * scale * M.sum(axis=1)  # (3,): black-level correction per output ch
+    m34      = np.hstack([M, bias.reshape(3,1)]).astype(np.float32)
+    _cache['ccm_key'] = key
+    _cache['ccm_m34'] = m34
+    return m34
+
+def gray_world_gains(bgr_small):
+    b = bgr_small[:,:,0].astype(np.float32)
+    g = bgr_small[:,:,1].astype(np.float32)
+    r = bgr_small[:,:,2].astype(np.float32)
     gray = (b + g + r) / 3.0
     diff = np.maximum(np.maximum(np.abs(r-gray), np.abs(g-gray)), np.abs(b-gray))
     mask = (diff < 20) & (gray > 20) & (gray < 220)
-    if mask.sum() > 500:
+    if mask.sum() > 200:
         rm = float(r[mask].mean()) + 1e-6
         gm = float(g[mask].mean()) + 1e-6
         bm = float(b[mask].mean()) + 1e-6
     else:
-        rm = float(r.mean()) + 1e-6
-        gm = float(g.mean()) + 1e-6
-        bm = float(b.mean()) + 1e-6
-    gr = float(np.clip(gm/rm, 0.5, 4.0))
-    gb = float(np.clip(gm/bm, 0.5, 4.0))
-    return gr, 1.0, gb
+        rm = float(r.mean()) + 1e-6; gm = float(g.mean()) + 1e-6; bm = float(b.mean()) + 1e-6
+    return float(np.clip(gm/rm, 0.5, 4.0)), 1.0, float(np.clip(gm/bm, 0.5, 4.0))
 
-
-# ── Full ISP pipeline ─────────────────────────────────────────────────────────
-def process_frame(raw: np.ndarray, params: dict) -> np.ndarray:
-    """
-    Full software ISP pipeline.
-    params keys:
-      black_level  int   [0,64]
-      awb          list  [gr, gg, gb]  linear gains
-      ccm_strength float [0,1]  blend between identity and CCM_DEFAULT
-      gamma        float [0.5, 3.0]
-      saturation   float [0, 3.0]  1.0 = unchanged
-      sharpness    float [0, 3.0]  0 = off
-      denoise      bool
-    """
-    bl      = params['black_level']
-    awb     = params['awb']
-    ccm_s   = params['ccm_strength']
-    gamma   = params['gamma']
-    sat     = params['saturation']
-    sharp   = params['sharpness']
+def process_frame(raw, params):
+    bl = params['black_level']; awb = params['awb']
+    ccm_s = params['ccm_strength']; gamma = params['gamma']
+    sat = params['saturation'];  sharp = params['sharpness']
     denoise = params['denoise']
 
-    # ── 1. Black level subtraction & normalise to [0,1] ───────────────────
-    linear = raw.astype(np.float32) - bl
-    np.clip(linear, 0, 255, out=linear)
-    linear /= (255.0 - bl)
+    # 1. Black-level clip + debayer (uint8 throughout)
+    raw_bl = raw.astype(np.int16) - bl
+    np.clip(raw_bl, 0, 255, out=raw_bl)
+    bgr = cv2.cvtColor(raw_bl.astype(np.uint8), cv2.COLOR_BayerRG2BGR)
 
-    # ── 2. Debayer (RGGB -> BGR) ──────────────────────────────────────────
-    raw8 = (linear * 255).astype(np.uint8)
-    bgr  = cv2.cvtColor(raw8, cv2.COLOR_BayerRG2BGR).astype(np.float32) / 255.0
+    # 2. AWB + CCM in one cv2.transform pass (float32 input, clipped to uint8)
+    m34  = _get_ccm_m34(awb, ccm_s, bl)
+    bgrf = cv2.transform(bgr.astype(np.float32), m34)
+    np.clip(bgrf, 0, 1, out=bgrf)
+    bgr  = (bgrf * 255).astype(np.uint8)
 
-    # ── 3. AWB gains (linear space) ───────────────────────────────────────
-    bgr[:,:,0] *= awb[2]   # B
-    bgr[:,:,1] *= awb[1]   # G
-    bgr[:,:,2] *= awb[0]   # R
-    np.clip(bgr, 0, 1, out=bgr)
+    # 3. Gamma via LUT (uint8->uint8)
+    bgr = cv2.LUT(bgr, _get_gamma_lut(gamma))
 
-    # ── 4. Color Correction Matrix (linear space) ─────────────────────────
-    if ccm_s > 0:
-        ccm = ccm_s * CCM_DEFAULT + (1.0 - ccm_s) * np.eye(3, dtype=np.float32)
-        # Reshape to (H*W, 3) for matrix multiply then back
-        flat  = bgr.reshape(-1, 3)
-        flat  = flat @ ccm.T          # (N,3) @ (3,3) -> (N,3)
-        bgr   = np.clip(flat, 0, 1).reshape(bgr.shape)
-
-    # ── 5. Gamma encoding (linear -> display) ────────────────────────────
-    lut = build_gamma_lut(gamma)
-    bgr8 = (np.clip(bgr, 0, 1) * 255).astype(np.uint8)
-    bgr8 = cv2.LUT(bgr8, lut)
-
-    # ── 6. Saturation (HSV) ───────────────────────────────────────────────
-    if abs(sat - 1.0) > 0.01:
-        hsv = cv2.cvtColor(bgr8, cv2.COLOR_BGR2HSV).astype(np.float32)
+    # 4. Saturation
+    if abs(sat - 1.0) > 0.02:
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
         hsv[:,:,1] = np.clip(hsv[:,:,1] * sat, 0, 255)
-        bgr8 = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+        bgr = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
 
-    # ── 7. Noise reduction ────────────────────────────────────────────────
+    # 5. Sharpening
+    if sharp > 0.02:
+        blur = cv2.GaussianBlur(bgr, (0,0), 2.0)
+        bgr  = cv2.addWeighted(bgr, 1.0+sharp, blur, -sharp, 0)
+
+    # 6. Denoise (off by default — slow)
     if denoise:
-        bgr8 = cv2.fastNlMeansDenoisingColored(bgr8, None, 5, 5, 7, 21)
+        bgr = cv2.fastNlMeansDenoisingColored(bgr, None, 5, 5, 7, 21)
 
-    # ── 8. Unsharp mask sharpening ────────────────────────────────────────
-    if sharp > 0:
-        blur   = cv2.GaussianBlur(bgr8, (0, 0), 2.0)
-        bgr8   = cv2.addWeighted(bgr8, 1.0 + sharp, blur, -sharp, 0)
-
-    return bgr8
+    return bgr
 
 
 # ==============================================================================
@@ -397,6 +380,7 @@ def run(args):
     alpha     = 0.05
     frame_n   = 0
     save_next = False
+    fps = 0.0; fps_t0 = time.time(); fps_count = 0
 
     print("\nKeys (camera window must have focus):")
     print("  q/ESC quit  |  s save snapshot.jpg  |  r reset  |  p print state\n")
@@ -406,26 +390,28 @@ def run(args):
         if raw is None:
             continue
         frame_n += 1
+        fps_count += 1
+        now = time.time()
+        if now - fps_t0 >= 1.0:
+            fps = fps_count / (now - fps_t0)
+            fps_count = 0; fps_t0 = now
 
         c = get_controls()
         ae.target = c['ae_target']
 
+        # Shared half-res debayer for AEC + AWB (avoids doing it twice)
+        raw_s = cv2.resize(raw, (raw.shape[1]//2, raw.shape[0]//2),
+                           interpolation=cv2.INTER_NEAREST).astype(np.int16)
+        raw_s = np.clip(raw_s - c['black_level'], 0, 255).astype(np.uint8)
+        rough_bgr = cv2.cvtColor(raw_s, cv2.COLOR_BayerRG2BGR)
+
         # ── AEC/AGC ──────────────────────────────────────────────────────
         if c['auto_aec']:
-            # Quick brightness estimate on raw (before full pipeline)
-            raw_bl = raw.astype(np.int16) - c['black_level']
-            np.clip(raw_bl, 0, 255, out=raw_bl)
-            rough_bgr = cv2.cvtColor(raw_bl.astype(np.uint8),
-                                      cv2.COLOR_BayerRG2BGR)
             brt = ae.measure(rough_bgr)
             ae.step(brt, ctrl)
 
         # ── AWB ───────────────────────────────────────────────────────────
         if c['auto_wb'] and frame_n % 5 == 0:
-            raw_bl = raw.astype(np.int16) - c['black_level']
-            np.clip(raw_bl, 0, 255, out=raw_bl)
-            rough_bgr = cv2.cvtColor(raw_bl.astype(np.uint8),
-                                      cv2.COLOR_BayerRG2BGR)
             gr, gg, gb = gray_world_gains(rough_bgr)
             awb[0] = alpha * gr + (1-alpha) * awb[0]
             awb[1] = 1.0
@@ -455,10 +441,10 @@ def run(args):
 
         # ── OSD ──────────────────────────────────────────────────────────
         disp = bgr_out.copy()
-        brt  = ae.measure(disp)
         wb_mode = "AUTO" if c['auto_wb'] else "MAN"
+        brt = ae.measure(rough_bgr)   # reuse half-res measurement
         osd = [
-            f"Frame {frame_n}",
+            f"FPS: {fps:.1f}   Frame: {frame_n}",
             f"Brightness: {brt:.0f} / target {c['ae_target']}",
             f"AnaGain : {ctrl.analog_gain:.2f}x (code {ctrl.ana_code})",
             f"DigGain : {ctrl.digital_gain:.2f}x",
