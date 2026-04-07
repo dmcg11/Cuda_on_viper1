@@ -43,12 +43,7 @@ Dependencies
 """
 
 import argparse
-import ctypes
-import errno
-import fcntl
-import mmap
 import os
-import select
 import sys
 import time
 
@@ -67,193 +62,47 @@ except ImportError:
 
 
 # ==============================================================================
-# Direct V4L2 capture (Tegra VI compatible)
+# Camera capture  (Tegra VI / OpenCV V4L2)
 # ==============================================================================
-
-_VIDIOC_G_FMT    = 0xC0D05604
-_VIDIOC_G_FMT    = 0xC0D05604
-_VIDIOC_S_FMT    = 0xC0D05605
-_VIDIOC_REQBUFS  = 0xC0145608
-_VIDIOC_QUERYBUF = 0xC0585609
-_VIDIOC_QBUF     = 0xC058560F
-_VIDIOC_DQBUF    = 0xC0585611
-_VIDIOC_STREAMON = 0x40045612
-_VIDIOC_STREAMOFF= 0x40045613
-
-_V4L2_BUF_TYPE_VIDEO_CAPTURE = 1
-_V4L2_MEMORY_MMAP            = 1
-_V4L2_PIX_FMT_SRGGB8         = 0x47425752   # fourcc 'RGGB'
-_V4L2_FIELD_ANY               = 0
-
-
-class _PixFmt(ctypes.Structure):
-    _fields_ = [
-        ("width",        ctypes.c_uint32),
-        ("height",       ctypes.c_uint32),
-        ("pixelformat",  ctypes.c_uint32),
-        ("field",        ctypes.c_uint32),
-        ("bytesperline", ctypes.c_uint32),
-        ("sizeimage",    ctypes.c_uint32),
-        ("colorspace",   ctypes.c_uint32),
-        ("priv",         ctypes.c_uint32),
-        ("flags",        ctypes.c_uint32),
-        ("enc",          ctypes.c_uint32),
-        ("quantization", ctypes.c_uint32),
-        ("xfer_func",    ctypes.c_uint32),
-    ]
-
-
-class _Fmt(ctypes.Structure):
-    class _U(ctypes.Union):
-        class _Raw(ctypes.Structure):
-            _fields_ = [("data", ctypes.c_uint8 * 200)]
-        _fields_ = [("pix", _PixFmt), ("raw_", _Raw)]
-    _fields_ = [("type", ctypes.c_uint32), ("fmt", _U)]
-
-
-class _ReqBufs(ctypes.Structure):
-    _fields_ = [
-        ("count",        ctypes.c_uint32),
-        ("type",         ctypes.c_uint32),
-        ("memory",       ctypes.c_uint32),
-        ("capabilities", ctypes.c_uint32),
-        ("reserved",     ctypes.c_uint32 * 1),
-    ]
-
-
-class _Timecode(ctypes.Structure):
-    _fields_ = [
-        ("type",     ctypes.c_uint32),
-        ("flags",    ctypes.c_uint32),
-        ("frames",   ctypes.c_uint8),
-        ("seconds",  ctypes.c_uint8),
-        ("minutes",  ctypes.c_uint8),
-        ("hours",    ctypes.c_uint8),
-        ("userbits", ctypes.c_uint8 * 4),
-    ]
-
-
-class _Buf(ctypes.Structure):
-    class _M(ctypes.Union):
-        _fields_ = [("offset",  ctypes.c_uint32),
-                    ("userptr", ctypes.c_ulong),
-                    ("planes",  ctypes.c_ulong),
-                    ("fd",      ctypes.c_int32)]
-    _fields_ = [
-        ("index",     ctypes.c_uint32),
-        ("type",      ctypes.c_uint32),
-        ("bytesused", ctypes.c_uint32),
-        ("flags",     ctypes.c_uint32),
-        ("field",     ctypes.c_uint32),
-        ("timestamp", ctypes.c_uint64),
-        ("timecode",  _Timecode),
-        ("sequence",  ctypes.c_uint32),
-        ("memory",    ctypes.c_uint32),
-        ("m",         _M),
-        ("length",    ctypes.c_uint32),
-        ("reserved2", ctypes.c_uint32),
-        ("reserved",  ctypes.c_uint32),
-    ]
-
-
-def _ioctl(fd, req, arg):
-    while True:
-        try:
-            fcntl.ioctl(fd, req, arg)
-            return
-        except OSError as e:
-            if e.errno == errno.EINTR:
-                continue
-            raise
-
+# The Tegra VI driver works with cv2.VideoCapture when:
+#   - CAP_PROP_FOURCC is set to the native sensor format BEFORE reading
+#   - CAP_PROP_CONVERT_RGB is 0  (do not let OpenCV convert the raw data)
+# For IMX219 RAW8 the fourcc is 'RGGB' (BayerRG8).
+# For the previous RAW12 sensor in streaming_a_camera.py it was 'BG12'.
 
 class TegraCapture:
-    """Zero-copy V4L2 mmap capture for Tegra VI RGGB8 nodes."""
-    N_BUFS = 4
+    """OpenCV V4L2 capture configured for Tegra VI RAW8 (RGGB) output."""
 
-    def __init__(self, device, width, height):
-        self.fd = os.open(device, os.O_RDWR | os.O_NONBLOCK)
-        self._maps = []
+    def __init__(self, device_index: int, width: int, height: int, fps: int = 30):
+        self._cap = cv2.VideoCapture(device_index, cv2.CAP_V4L2)
+        if not self._cap.isOpened():
+            raise RuntimeError(f"Cannot open /dev/video{device_index}")
 
-        # Tegra VI ignores S_FMT and returns zeros from it.
-        # Use G_FMT to read the format the kernel already configured.
-        fmt = _Fmt()
-        fmt.type = _V4L2_BUF_TYPE_VIDEO_CAPTURE
-        _ioctl(self.fd, _VIDIOC_G_FMT, fmt)
+        # Must set fourcc and disable RGB conversion BEFORE the first read
+        self._cap.set(cv2.CAP_PROP_FOURCC,
+                      cv2.VideoWriter_fourcc(*'RGGB'))   # RAW8 Bayer RGGB
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self._cap.set(cv2.CAP_PROP_FPS,          fps)
+        self._cap.set(cv2.CAP_PROP_CONVERT_RGB,  0)     # keep raw Bayer bytes
 
-        self.width     = fmt.fmt.pix.width
-        self.height    = fmt.fmt.pix.height
-        self.stride    = fmt.fmt.pix.bytesperline
-        self.sizeimage = fmt.fmt.pix.sizeimage
-
-        # Guard: if G_FMT returns zeros fall back to S_FMT
-        if self.stride == 0 or self.sizeimage == 0:
-            print("[CAP] G_FMT returned zeros, trying S_FMT...")
-            fmt.fmt.pix.width       = width
-            fmt.fmt.pix.height      = height
-            fmt.fmt.pix.pixelformat = _V4L2_PIX_FMT_SRGGB8
-            fmt.fmt.pix.field       = _V4L2_FIELD_ANY
-            _ioctl(self.fd, _VIDIOC_S_FMT, fmt)
-            self.width     = fmt.fmt.pix.width
-            self.height    = fmt.fmt.pix.height
-            self.stride    = fmt.fmt.pix.bytesperline
-            self.sizeimage = fmt.fmt.pix.sizeimage
-
-        fourcc  = fmt.fmt.pix.pixelformat
-        fcc_str = "".join(chr((fourcc >> i) & 0xFF) for i in (0, 8, 16, 24))
-        print(f"[CAP] {device}  {self.width}x{self.height}  "
-              f"fmt={fcc_str}  stride={self.stride}  size={self.sizeimage}")
-
-        req = _ReqBufs()
-        req.count  = self.N_BUFS
-        req.type   = _V4L2_BUF_TYPE_VIDEO_CAPTURE
-        req.memory = _V4L2_MEMORY_MMAP
-        _ioctl(self.fd, _VIDIOC_REQBUFS, req)
-
-        for i in range(req.count):
-            b = _Buf()
-            b.type   = _V4L2_BUF_TYPE_VIDEO_CAPTURE
-            b.memory = _V4L2_MEMORY_MMAP
-            b.index  = i
-            _ioctl(self.fd, _VIDIOC_QUERYBUF, b)
-            mm = mmap.mmap(self.fd, b.length,
-                           mmap.MAP_SHARED,
-                           mmap.PROT_READ | mmap.PROT_WRITE,
-                           offset=b.m.offset)
-            self._maps.append((mm, b.length))
-            _ioctl(self.fd, _VIDIOC_QBUF, b)
-
-        bt = ctypes.c_int(_V4L2_BUF_TYPE_VIDEO_CAPTURE)
-        _ioctl(self.fd, _VIDIOC_STREAMON, bt)
+        self.width  = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        print(f"[CAP] /dev/video{device_index}  "
+              f"{self.width}x{self.height}  RAW8 RGGB")
 
     def read(self):
-        r, _, _ = select.select([self.fd], [], [], 2.0)
-        if not r:
-            print("[WARN] Frame timeout")
+        """Return (H, W) uint8 numpy array or None on failure."""
+        ret, frame = self._cap.read()
+        if not ret:
             return None
-
-        b = _Buf()
-        b.type   = _V4L2_BUF_TYPE_VIDEO_CAPTURE
-        b.memory = _V4L2_MEMORY_MMAP
-        _ioctl(self.fd, _VIDIOC_DQBUF, b)
-
-        mm, _ = self._maps[b.index]
-        mm.seek(0)
-        raw = np.frombuffer(mm.read(b.bytesused), dtype=np.uint8)
-        frame = raw.reshape((self.height, self.stride))[:, :self.width].copy()
-
-        _ioctl(self.fd, _VIDIOC_QBUF, b)
-        return frame
+        # Frame arrives as a flat or 2-channel array depending on driver;
+        # reshape to (H, W) uint8 in all cases.
+        raw = frame.reshape((self.height, self.width))
+        return raw
 
     def release(self):
-        try:
-            bt = ctypes.c_int(_V4L2_BUF_TYPE_VIDEO_CAPTURE)
-            _ioctl(self.fd, _VIDIOC_STREAMOFF, bt)
-        except Exception:
-            pass
-        for mm, _ in self._maps:
-            mm.close()
-        os.close(self.fd)
+        self._cap.release()
 
 
 # ==============================================================================
@@ -469,7 +318,9 @@ class AEController:
 # Main loop
 # ==============================================================================
 def run(args):
-    cap  = TegraCapture(args.device, args.width, args.height)
+    # Extract integer index from device string e.g. "/dev/video5" -> 5
+    dev_idx = int(''.join(filter(str.isdigit, args.device)) or 0)
+    cap  = TegraCapture(dev_idx, args.width, args.height)
     i2c  = IMX219I2C(args.i2c_bus, args.i2c_addr)
     ctrl = IMX219Controller(i2c)
     ae   = AEController(target=args.target_brightness)
