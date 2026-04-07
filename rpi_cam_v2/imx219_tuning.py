@@ -70,6 +70,8 @@ except ImportError:
 # Direct V4L2 capture (Tegra VI compatible)
 # ==============================================================================
 
+_VIDIOC_G_FMT    = 0xC0D05604
+_VIDIOC_G_FMT    = 0xC0D05604
 _VIDIOC_S_FMT    = 0xC0D05605
 _VIDIOC_REQBUFS  = 0xC0145608
 _VIDIOC_QUERYBUF = 0xC0585609
@@ -173,20 +175,34 @@ class TegraCapture:
         self.fd = os.open(device, os.O_RDWR | os.O_NONBLOCK)
         self._maps = []
 
+        # Tegra VI ignores S_FMT and returns zeros from it.
+        # Use G_FMT to read the format the kernel already configured.
         fmt = _Fmt()
-        fmt.type                = _V4L2_BUF_TYPE_VIDEO_CAPTURE
-        fmt.fmt.pix.width       = width
-        fmt.fmt.pix.height      = height
-        fmt.fmt.pix.pixelformat = _V4L2_PIX_FMT_SRGGB8
-        fmt.fmt.pix.field       = _V4L2_FIELD_ANY
-        _ioctl(self.fd, _VIDIOC_S_FMT, fmt)
+        fmt.type = _V4L2_BUF_TYPE_VIDEO_CAPTURE
+        _ioctl(self.fd, _VIDIOC_G_FMT, fmt)
 
         self.width     = fmt.fmt.pix.width
         self.height    = fmt.fmt.pix.height
         self.stride    = fmt.fmt.pix.bytesperline
         self.sizeimage = fmt.fmt.pix.sizeimage
+
+        # Guard: if G_FMT returns zeros fall back to S_FMT
+        if self.stride == 0 or self.sizeimage == 0:
+            print("[CAP] G_FMT returned zeros, trying S_FMT...")
+            fmt.fmt.pix.width       = width
+            fmt.fmt.pix.height      = height
+            fmt.fmt.pix.pixelformat = _V4L2_PIX_FMT_SRGGB8
+            fmt.fmt.pix.field       = _V4L2_FIELD_ANY
+            _ioctl(self.fd, _VIDIOC_S_FMT, fmt)
+            self.width     = fmt.fmt.pix.width
+            self.height    = fmt.fmt.pix.height
+            self.stride    = fmt.fmt.pix.bytesperline
+            self.sizeimage = fmt.fmt.pix.sizeimage
+
+        fourcc  = fmt.fmt.pix.pixelformat
+        fcc_str = "".join(chr((fourcc >> i) & 0xFF) for i in (0, 8, 16, 24))
         print(f"[CAP] {device}  {self.width}x{self.height}  "
-              f"stride={self.stride}  size={self.sizeimage}")
+              f"fmt={fcc_str}  stride={self.stride}  size={self.sizeimage}")
 
         req = _ReqBufs()
         req.count  = self.N_BUFS
