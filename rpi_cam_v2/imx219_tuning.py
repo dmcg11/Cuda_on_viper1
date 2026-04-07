@@ -1,527 +1,534 @@
 #!/usr/bin/env python3
 """
-IMX219 RAW8 Camera Tuning Script
-=================================
-Performs software-side AWB, AEC/AGC, and black level correction on RAW8 Bayer
-frames captured from an IMX219 sensor.  Sensor parameters (analog gain,
-digital gain, exposure / coarse integration time) are written back to the
-sensor over I2C so that the loop closes on-hardware, not just in software.
+IMX219 RAW8 Camera Tuning Script  (Jetson / Tegra VI edition)
+=============================================================
+Performs software AWB, AEC/AGC, and black-level correction on RAW8 Bayer
+frames from an IMX219 sensor on a Jetson (tegra-video driver).
 
-Register map (sourced from linux/drivers/media/i2c/imx219.c and the Sony
-IMX219PQH5-C datasheet):
+Capture uses direct V4L2 ioctls + mmap – NOT OpenCV's generic V4L2 backend –
+because Tegra VI nodes require an explicit VIDIOC_S_FMT('RGGB') before the
+device can be opened for streaming.
 
-  0x0100          MODE_SELECT      – 0x00 = standby, 0x01 = streaming
-  0x0157          ANA_GAIN_GLOBAL  – 8-bit, range 0–232
-                                     Gain = 256 / (256 - code)
-  0x0158–0x0159   DIG_GAIN_GLOBAL  – 12-bit [11:8 in 0x0158, 7:0 in 0x0159]
-                                     Range 0x0100 (1×) – 0x0FFF (~16×)
-                                     Applied as gain/256
-  0x015A–0x015B   COARSE_INTEG_TIME – 16-bit exposure in lines
-                                     Min 4, max FRM_LENGTH - 4
-  0x0160–0x0161   FRM_LENGTH_A     – 16-bit total frame lines (VTS)
+Sensor registers are written back over I2C (smbus2) to close the AE/AG loop
+on hardware, not just in software.
+
+Register map (linux/drivers/media/i2c/imx219.c + Sony IMX219PQH5-C datasheet)
+  0x0157          ANA_GAIN_GLOBAL_A   8-bit   range 0-232
+  0x0158-0x0159   DIG_GAIN_GLOBAL_A   12-bit  range 0x0100-0x0FFF (=1x-~16x)
+  0x015A-0x015B   COARSE_INTEG_TIME_A 16-bit  range 4-65535 lines
+  0x0160-0x0161   FRM_LENGTH_A        16-bit  VTS
+
+Your v4l2-ctl output shows: "cam_v1 1-0008" -> I2C bus 1, address 0x08.
+Default --i2c-addr is 0x08.
 
 Usage
 -----
-  python3 imx219_tuning.py [--device /dev/video0] [--i2c-bus 10]
-                           [--width 3280] [--height 2464]
-                           [--target-brightness 100]
-                           [--no-awb] [--no-aec]
+  python3 imx219_tuning.py --device /dev/video5 --i2c-bus 1 --i2c-addr 0x08
+
+  Optional flags:
+    --width  1920  --height 1080      (default)
+    --target-brightness 100           (0-255, default 100)
+    --no-awb                          disable gray-world AWB
+    --no-aec                          disable auto-exposure/gain
+
+Runtime keys (OpenCV window must have focus):
+    q / ESC  quit
+    r        reset all gains + exposure to sensor defaults
+    s        save current debayered+WB frame as PNG
+    p        print current sensor register state
 
 Dependencies
 ------------
-  pip install opencv-python smbus2 numpy
+  pip install smbus2 numpy opencv-python
 """
 
 import argparse
+import ctypes
+import errno
+import fcntl
+import mmap
+import os
+import select
 import sys
 import time
-import numpy as np
-import cv2
 
-# ---------------------------------------------------------------------------
-# Optional smbus2 import – gracefully degrade if not present
-# ---------------------------------------------------------------------------
+import cv2
+import numpy as np
+
+# ------------------------------------------------------------------------------
+# smbus2 - optional; register writes silently skipped if absent
+# ------------------------------------------------------------------------------
 try:
     import smbus2
     HAS_SMBUS = True
 except ImportError:
     HAS_SMBUS = False
-    print("[WARN] smbus2 not found – I2C register writes disabled. "
-          "Install with: pip install smbus2")
+    print("[WARN] smbus2 not found - I2C writes disabled.  pip install smbus2")
 
-# ---------------------------------------------------------------------------
-# IMX219 register definitions  (from torvalds/linux drivers/media/i2c/imx219.c)
-# ---------------------------------------------------------------------------
-IMX219_I2C_ADDR         = 0x10          # 7-bit I2C address
 
-REG_MODE_SELECT         = 0x0100        # 0x00=standby, 0x01=streaming
-REG_CHIP_ID_HI          = 0x0000        # should read 0x02
-REG_CHIP_ID_LO          = 0x0001        # should read 0x19
+# ==============================================================================
+# Direct V4L2 capture (Tegra VI compatible)
+# ==============================================================================
 
-REG_ANA_GAIN            = 0x0157        # 8-bit  analogue_gain_code_global
-ANA_GAIN_MIN            = 0
-ANA_GAIN_MAX            = 232
-ANA_GAIN_DEFAULT        = 0
+_VIDIOC_S_FMT    = 0xC0D05605
+_VIDIOC_REQBUFS  = 0xC0145608
+_VIDIOC_QUERYBUF = 0xC0585609
+_VIDIOC_QBUF     = 0xC058560F
+_VIDIOC_DQBUF    = 0xC0585611
+_VIDIOC_STREAMON = 0x40045612
+_VIDIOC_STREAMOFF= 0x40045613
 
-REG_DIG_GAIN_HI         = 0x0158        # bits [11:8] of 12-bit digital gain
-REG_DIG_GAIN_LO         = 0x0159        # bits  [7:0]
-DIG_GAIN_MIN            = 0x0100        # 1.0×
-DIG_GAIN_MAX            = 0x0FFF        # ~16×
-DIG_GAIN_DEFAULT        = 0x0100
+_V4L2_BUF_TYPE_VIDEO_CAPTURE = 1
+_V4L2_MEMORY_MMAP            = 1
+_V4L2_PIX_FMT_SRGGB8         = 0x47425752   # fourcc 'RGGB'
+_V4L2_FIELD_ANY               = 0
 
-REG_COARSE_INTEG_HI     = 0x015A        # exposure [15:8]
-REG_COARSE_INTEG_LO     = 0x015B        # exposure [7:0]
-EXPOSURE_MIN            = 4
-EXPOSURE_MAX            = 65535
-EXPOSURE_DEFAULT        = 0x0640        # 1600 lines
 
-REG_FRM_LENGTH_HI       = 0x0160        # VTS [15:8]
-REG_FRM_LENGTH_LO       = 0x0161        # VTS [7:0]
+class _PixFmt(ctypes.Structure):
+    _fields_ = [
+        ("width",        ctypes.c_uint32),
+        ("height",       ctypes.c_uint32),
+        ("pixelformat",  ctypes.c_uint32),
+        ("field",        ctypes.c_uint32),
+        ("bytesperline", ctypes.c_uint32),
+        ("sizeimage",    ctypes.c_uint32),
+        ("colorspace",   ctypes.c_uint32),
+        ("priv",         ctypes.c_uint32),
+        ("flags",        ctypes.c_uint32),
+        ("enc",          ctypes.c_uint32),
+        ("quantization", ctypes.c_uint32),
+        ("xfer_func",    ctypes.c_uint32),
+    ]
 
-# Black level: RAW8 pedestal = 64>>2 = 16  (10-bit native / 4)
-BAYER_BLACK_LEVEL_RAW8  = 16
-BAYER_WHITE_LEVEL_RAW8  = 255
 
-# IMX219 Bayer pattern (RGGB native)
-BAYER_PATTERN           = cv2.COLOR_BayerRG2BGR        # RAW8 RGGB → BGR
+class _Fmt(ctypes.Structure):
+    class _U(ctypes.Union):
+        class _Raw(ctypes.Structure):
+            _fields_ = [("data", ctypes.c_uint8 * 200)]
+        _fields_ = [("pix", _PixFmt), ("raw_", _Raw)]
+    _fields_ = [("type", ctypes.c_uint32), ("fmt", _U)]
 
-# ---------------------------------------------------------------------------
-# I2C helper
-# ---------------------------------------------------------------------------
+
+class _ReqBufs(ctypes.Structure):
+    _fields_ = [
+        ("count",        ctypes.c_uint32),
+        ("type",         ctypes.c_uint32),
+        ("memory",       ctypes.c_uint32),
+        ("capabilities", ctypes.c_uint32),
+        ("reserved",     ctypes.c_uint32 * 1),
+    ]
+
+
+class _Timecode(ctypes.Structure):
+    _fields_ = [
+        ("type",     ctypes.c_uint32),
+        ("flags",    ctypes.c_uint32),
+        ("frames",   ctypes.c_uint8),
+        ("seconds",  ctypes.c_uint8),
+        ("minutes",  ctypes.c_uint8),
+        ("hours",    ctypes.c_uint8),
+        ("userbits", ctypes.c_uint8 * 4),
+    ]
+
+
+class _Buf(ctypes.Structure):
+    class _M(ctypes.Union):
+        _fields_ = [("offset",  ctypes.c_uint32),
+                    ("userptr", ctypes.c_ulong),
+                    ("planes",  ctypes.c_ulong),
+                    ("fd",      ctypes.c_int32)]
+    _fields_ = [
+        ("index",     ctypes.c_uint32),
+        ("type",      ctypes.c_uint32),
+        ("bytesused", ctypes.c_uint32),
+        ("flags",     ctypes.c_uint32),
+        ("field",     ctypes.c_uint32),
+        ("timestamp", ctypes.c_uint64),
+        ("timecode",  _Timecode),
+        ("sequence",  ctypes.c_uint32),
+        ("memory",    ctypes.c_uint32),
+        ("m",         _M),
+        ("length",    ctypes.c_uint32),
+        ("reserved2", ctypes.c_uint32),
+        ("reserved",  ctypes.c_uint32),
+    ]
+
+
+def _ioctl(fd, req, arg):
+    while True:
+        try:
+            fcntl.ioctl(fd, req, arg)
+            return
+        except OSError as e:
+            if e.errno == errno.EINTR:
+                continue
+            raise
+
+
+class TegraCapture:
+    """Zero-copy V4L2 mmap capture for Tegra VI RGGB8 nodes."""
+    N_BUFS = 4
+
+    def __init__(self, device, width, height):
+        self.fd = os.open(device, os.O_RDWR | os.O_NONBLOCK)
+        self._maps = []
+
+        fmt = _Fmt()
+        fmt.type                = _V4L2_BUF_TYPE_VIDEO_CAPTURE
+        fmt.fmt.pix.width       = width
+        fmt.fmt.pix.height      = height
+        fmt.fmt.pix.pixelformat = _V4L2_PIX_FMT_SRGGB8
+        fmt.fmt.pix.field       = _V4L2_FIELD_ANY
+        _ioctl(self.fd, _VIDIOC_S_FMT, fmt)
+
+        self.width     = fmt.fmt.pix.width
+        self.height    = fmt.fmt.pix.height
+        self.stride    = fmt.fmt.pix.bytesperline
+        self.sizeimage = fmt.fmt.pix.sizeimage
+        print(f"[CAP] {device}  {self.width}x{self.height}  "
+              f"stride={self.stride}  size={self.sizeimage}")
+
+        req = _ReqBufs()
+        req.count  = self.N_BUFS
+        req.type   = _V4L2_BUF_TYPE_VIDEO_CAPTURE
+        req.memory = _V4L2_MEMORY_MMAP
+        _ioctl(self.fd, _VIDIOC_REQBUFS, req)
+
+        for i in range(req.count):
+            b = _Buf()
+            b.type   = _V4L2_BUF_TYPE_VIDEO_CAPTURE
+            b.memory = _V4L2_MEMORY_MMAP
+            b.index  = i
+            _ioctl(self.fd, _VIDIOC_QUERYBUF, b)
+            mm = mmap.mmap(self.fd, b.length,
+                           mmap.MAP_SHARED,
+                           mmap.PROT_READ | mmap.PROT_WRITE,
+                           offset=b.m.offset)
+            self._maps.append((mm, b.length))
+            _ioctl(self.fd, _VIDIOC_QBUF, b)
+
+        bt = ctypes.c_int(_V4L2_BUF_TYPE_VIDEO_CAPTURE)
+        _ioctl(self.fd, _VIDIOC_STREAMON, bt)
+
+    def read(self):
+        r, _, _ = select.select([self.fd], [], [], 2.0)
+        if not r:
+            print("[WARN] Frame timeout")
+            return None
+
+        b = _Buf()
+        b.type   = _V4L2_BUF_TYPE_VIDEO_CAPTURE
+        b.memory = _V4L2_MEMORY_MMAP
+        _ioctl(self.fd, _VIDIOC_DQBUF, b)
+
+        mm, _ = self._maps[b.index]
+        mm.seek(0)
+        raw = np.frombuffer(mm.read(b.bytesused), dtype=np.uint8)
+        frame = raw.reshape((self.height, self.stride))[:, :self.width].copy()
+
+        _ioctl(self.fd, _VIDIOC_QBUF, b)
+        return frame
+
+    def release(self):
+        try:
+            bt = ctypes.c_int(_V4L2_BUF_TYPE_VIDEO_CAPTURE)
+            _ioctl(self.fd, _VIDIOC_STREAMOFF, bt)
+        except Exception:
+            pass
+        for mm, _ in self._maps:
+            mm.close()
+        os.close(self.fd)
+
+
+# ==============================================================================
+# IMX219 register definitions
+# ==============================================================================
+REG_ANA_GAIN     = 0x0157
+ANA_GAIN_MIN     = 0
+ANA_GAIN_MAX     = 232
+ANA_GAIN_DEFAULT = 0
+
+REG_DIG_GAIN_HI  = 0x0158
+REG_DIG_GAIN_LO  = 0x0159
+DIG_GAIN_MIN     = 0x0100
+DIG_GAIN_MAX     = 0x0FFF
+DIG_GAIN_DEFAULT = 0x0100
+
+REG_EXPOSURE_HI  = 0x015A
+REG_EXPOSURE_LO  = 0x015B
+EXPOSURE_MIN     = 4
+EXPOSURE_MAX     = 65535
+EXPOSURE_DEFAULT = 0x0640
+
+BAYER_BLACK_LEVEL = 16    # RAW8 pedestal  (native 10-bit 64 >> 2)
+BAYER_WHITE_LEVEL = 255
+
+
+# ==============================================================================
+# I2C  (16-bit CCI addressing)
+# ==============================================================================
 class IMX219I2C:
-    """Thin wrapper around smbus2 for 16-bit register address writes."""
-
-    def __init__(self, bus_num: int):
+    def __init__(self, bus, addr):
+        self._addr = addr
         if not HAS_SMBUS:
             self._bus = None
             return
-        self._bus = smbus2.SMBus(bus_num)
-        print(f"[I2C] Opened /dev/i2c-{bus_num}")
+        self._bus = smbus2.SMBus(bus)
+        print(f"[I2C] /dev/i2c-{bus}  addr=0x{addr:02X}")
+        self._verify()
 
-    def _reg16_to_bytes(self, reg: int):
-        return [(reg >> 8) & 0xFF, reg & 0xFF]
+    def _verify(self):
+        hi  = self._read8(0x0000)
+        lo  = self._read8(0x0001)
+        cid = (hi << 8) | lo
+        ok  = "OK" if cid == 0x0219 else "UNEXPECTED - check --i2c-addr"
+        print(f"[I2C] Chip ID 0x{cid:04X}  {ok}")
 
-    def write8(self, reg: int, value: int):
-        """Write one byte to a 16-bit addressed register."""
-        if self._bus is None:
-            return
-        msg = smbus2.i2c_msg.write(IMX219_I2C_ADDR,
-                                   self._reg16_to_bytes(reg) + [value & 0xFF])
-        self._bus.i2c_rdwr(msg)
-
-    def read8(self, reg: int) -> int:
-        """Read one byte from a 16-bit addressed register."""
+    def _read8(self, reg):
         if self._bus is None:
             return 0
-        write_msg = smbus2.i2c_msg.write(IMX219_I2C_ADDR,
-                                         self._reg16_to_bytes(reg))
-        read_msg  = smbus2.i2c_msg.read(IMX219_I2C_ADDR, 1)
-        self._bus.i2c_rdwr(write_msg, read_msg)
-        return list(read_msg)[0]
+        wb = smbus2.i2c_msg.write(self._addr, [(reg >> 8) & 0xFF, reg & 0xFF])
+        rb = smbus2.i2c_msg.read(self._addr, 1)
+        self._bus.i2c_rdwr(wb, rb)
+        return list(rb)[0]
 
-    def verify_chip_id(self) -> bool:
-        hi = self.read8(REG_CHIP_ID_HI)
-        lo = self.read8(REG_CHIP_ID_LO)
-        chip_id = (hi << 8) | lo
-        if chip_id == 0x0219:
-            print(f"[I2C] Chip ID OK: 0x{chip_id:04X}")
-            return True
-        print(f"[WARN] Unexpected chip ID: 0x{chip_id:04X} (expected 0x0219)")
-        return False
+    def write8(self, reg, val):
+        if self._bus is None:
+            return
+        msg = smbus2.i2c_msg.write(
+            self._addr, [(reg >> 8) & 0xFF, reg & 0xFF, val & 0xFF])
+        self._bus.i2c_rdwr(msg)
 
     def close(self):
         if self._bus is not None:
             self._bus.close()
 
 
-# ---------------------------------------------------------------------------
-# Sensor parameter controller
-# ---------------------------------------------------------------------------
+# ==============================================================================
+# Sensor controller
+# ==============================================================================
 class IMX219Controller:
-    """
-    Manages sensor state and translates logical values (real gain, exposure µs)
-    to register codes, then writes them over I2C.
+    LINE_TIME_US = 3448.0 / 182_400_000.0 * 1e6  # ~18.90 us
 
-    Analog gain formula (from Sony datasheet):
-        Gain = 256 / (256 – ANA_GAIN_CODE)
-        ANA_GAIN_CODE = 256 – 256/Gain   → clamped to [0, 232]
-
-    Digital gain:
-        Register value = desired_multiplier × 256  (12-bit, range 256–4095)
-
-    Exposure:
-        The register stores coarse integration time in *lines*.
-        lines = exposure_us × pixel_clock_per_line / 1_000_000
-        For default 1080p30 mode: line_length = 3448 px, pixel_rate ≈ 182.4 MHz
-            → line_time ≈ 18.9 µs
-        We expose this as lines directly for precision; callers convert if needed.
-    """
-
-    # Approximate line time for IMX219 in 1080p (30fps) mode
-    # line_length=3448, pixel_rate=182,400,000 → ~18.9 µs/line
-    LINE_TIME_US = 3448.0 / 182_400_000.0 * 1e6   # ≈ 18.90 µs
-
-    def __init__(self, i2c: IMX219I2C):
-        self._i2c = i2c
-        self.ana_gain_code  = ANA_GAIN_DEFAULT      # sensor register value
-        self.dig_gain_code  = DIG_GAIN_DEFAULT       # sensor register value
+    def __init__(self, i2c):
+        self._i2c           = i2c
+        self.ana_code       = ANA_GAIN_DEFAULT
+        self.dig_code       = DIG_GAIN_DEFAULT
         self.exposure_lines = EXPOSURE_DEFAULT
-        self._apply()
+        self._flush()
 
-    # ------------------------------------------------------------------
-    # Public accessors (work in physical units)
-    # ------------------------------------------------------------------
     @property
-    def analog_gain(self) -> float:
-        """Real analog gain (1.0 – ~8.0)."""
-        return 256.0 / max(1, 256 - self.ana_gain_code)
+    def analog_gain(self):
+        return 256.0 / max(1, 256 - self.ana_code)
 
     @analog_gain.setter
-    def analog_gain(self, gain: float):
-        gain = max(1.0, gain)
-        code = int(round(256.0 - 256.0 / gain))
-        self.ana_gain_code = int(np.clip(code, ANA_GAIN_MIN, ANA_GAIN_MAX))
-        self._write_analog_gain()
+    def analog_gain(self, g):
+        g = max(1.0, g)
+        self.ana_code = int(np.clip(round(256.0 - 256.0 / g),
+                                    ANA_GAIN_MIN, ANA_GAIN_MAX))
+        self._i2c.write8(REG_ANA_GAIN, self.ana_code)
 
     @property
-    def digital_gain(self) -> float:
-        """Real digital gain (1.0 – ~16.0)."""
-        return self.dig_gain_code / 256.0
+    def digital_gain(self):
+        return self.dig_code / 256.0
 
     @digital_gain.setter
-    def digital_gain(self, gain: float):
-        code = int(round(gain * 256.0))
-        self.dig_gain_code = int(np.clip(code, DIG_GAIN_MIN, DIG_GAIN_MAX))
-        self._write_digital_gain()
+    def digital_gain(self, g):
+        self.dig_code = int(np.clip(round(g * 256.0),
+                                    DIG_GAIN_MIN, DIG_GAIN_MAX))
+        self._i2c.write8(REG_DIG_GAIN_HI, (self.dig_code >> 8) & 0x0F)
+        self._i2c.write8(REG_DIG_GAIN_LO,  self.dig_code        & 0xFF)
 
     @property
-    def exposure_us(self) -> float:
+    def exposure_us(self):
         return self.exposure_lines * self.LINE_TIME_US
 
     @exposure_us.setter
-    def exposure_us(self, us: float):
-        lines = int(round(us / self.LINE_TIME_US))
-        self.exposure_lines = int(np.clip(lines, EXPOSURE_MIN, EXPOSURE_MAX))
-        self._write_exposure()
+    def exposure_us(self, us):
+        self.exposure_lines = int(np.clip(round(us / self.LINE_TIME_US),
+                                           EXPOSURE_MIN, EXPOSURE_MAX))
+        self._i2c.write8(REG_EXPOSURE_HI, (self.exposure_lines >> 8) & 0xFF)
+        self._i2c.write8(REG_EXPOSURE_LO,  self.exposure_lines        & 0xFF)
 
-    # ------------------------------------------------------------------
-    # I2C writes
-    # ------------------------------------------------------------------
-    def _write_analog_gain(self):
-        self._i2c.write8(REG_ANA_GAIN, self.ana_gain_code)
+    def reset(self):
+        self.ana_code       = ANA_GAIN_DEFAULT
+        self.dig_code       = DIG_GAIN_DEFAULT
+        self.exposure_lines = EXPOSURE_DEFAULT
+        self._flush()
 
-    def _write_digital_gain(self):
-        self._i2c.write8(REG_DIG_GAIN_HI, (self.dig_gain_code >> 8) & 0x0F)
-        self._i2c.write8(REG_DIG_GAIN_LO,  self.dig_gain_code        & 0xFF)
-
-    def _write_exposure(self):
-        self._i2c.write8(REG_COARSE_INTEG_HI, (self.exposure_lines >> 8) & 0xFF)
-        self._i2c.write8(REG_COARSE_INTEG_LO,  self.exposure_lines        & 0xFF)
-
-    def _apply(self):
-        self._write_analog_gain()
-        self._write_digital_gain()
-        self._write_exposure()
+    def _flush(self):
+        self._i2c.write8(REG_ANA_GAIN,    self.ana_code)
+        self._i2c.write8(REG_DIG_GAIN_HI, (self.dig_code >> 8) & 0x0F)
+        self._i2c.write8(REG_DIG_GAIN_LO,  self.dig_code        & 0xFF)
+        self._i2c.write8(REG_EXPOSURE_HI, (self.exposure_lines >> 8) & 0xFF)
+        self._i2c.write8(REG_EXPOSURE_LO,  self.exposure_lines        & 0xFF)
 
     def print_state(self):
-        print(f"  Analog gain  : code={self.ana_gain_code:3d}  "
-              f"→ {self.analog_gain:.3f}×")
-        print(f"  Digital gain : code=0x{self.dig_gain_code:04X}  "
-              f"→ {self.digital_gain:.3f}×")
-        print(f"  Exposure     : {self.exposure_lines} lines  "
-              f"≈ {self.exposure_us:.1f} µs")
+        print(f"  Analog  gain : code={self.ana_code:3d}  -> {self.analog_gain:.3f}x")
+        print(f"  Digital gain : code=0x{self.dig_code:04X}  -> {self.digital_gain:.3f}x")
+        print(f"  Exposure     : {self.exposure_lines} lines  ~{self.exposure_us:.0f} us")
 
 
-# ---------------------------------------------------------------------------
-# Image processing helpers
-# ---------------------------------------------------------------------------
-def debayer(raw8: np.ndarray) -> np.ndarray:
-    """Debayer a RAW8 RGGB frame into a BGR uint8 image."""
-    return cv2.cvtColor(raw8, BAYER_PATTERN)
+# ==============================================================================
+# Image processing
+# ==============================================================================
+def subtract_black(raw, bl=BAYER_BLACK_LEVEL):
+    out = raw.astype(np.int16) - bl
+    np.clip(out, 0, 255, out=out)
+    scale = 255.0 / (BAYER_WHITE_LEVEL - bl)
+    return np.clip(out * scale, 0, 255).astype(np.uint8)
 
 
-def subtract_black_level(raw8: np.ndarray,
-                          black: int = BAYER_BLACK_LEVEL_RAW8) -> np.ndarray:
-    """
-    Subtract the sensor pedestal and rescale to [0, 255].
-    The IMX219 RAW8 black level is nominally 16 (64>>2).
-    """
-    clamped = raw8.astype(np.int16) - black
-    np.clip(clamped, 0, 255, out=clamped)
-    # Rescale so that white_level - black maps to 255
-    scale = 255.0 / (BAYER_WHITE_LEVEL_RAW8 - black)
-    return np.clip(clamped * scale, 0, 255).astype(np.uint8)
+def debayer(raw):
+    return cv2.cvtColor(raw, cv2.COLOR_BayerRG2BGR)
 
 
-# ---------------------------------------------------------------------------
-# AWB – Gray-World
-# ---------------------------------------------------------------------------
-def gray_world_awb(bgr: np.ndarray):
-    """
-    Gray-world AWB.  Returns (gain_r, gain_g, gain_b) where gains normalise
-    each channel to the global mean.  gain_g is fixed at 1.0; r and b are
-    adjusted relative to green.
-    """
-    b = bgr[:, :, 0].astype(np.float32)
-    g = bgr[:, :, 1].astype(np.float32)
-    r = bgr[:, :, 2].astype(np.float32)
-
-    mean_b = np.mean(b) + 1e-6
-    mean_g = np.mean(g) + 1e-6
-    mean_r = np.mean(r) + 1e-6
-
-    gain_b = mean_g / mean_b
-    gain_g = 1.0
-    gain_r = mean_g / mean_r
-
-    return gain_r, gain_g, gain_b
+def gray_world_gains(bgr):
+    b  = bgr[:, :, 0].astype(np.float32)
+    g  = bgr[:, :, 1].astype(np.float32)
+    r  = bgr[:, :, 2].astype(np.float32)
+    mg = np.mean(g) + 1e-6
+    return mg / (np.mean(r) + 1e-6), 1.0, mg / (np.mean(b) + 1e-6)
 
 
-def apply_awb_gains(bgr: np.ndarray, gr: float, gg: float, gb: float
-                    ) -> np.ndarray:
-    """Apply per-channel gains; clip to [0, 255]."""
+def apply_gains(bgr, gr, gg, gb):
     out = bgr.astype(np.float32)
-    out[:, :, 0] *= gb
-    out[:, :, 1] *= gg
     out[:, :, 2] *= gr
+    out[:, :, 1] *= gg
+    out[:, :, 0] *= gb
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-# ---------------------------------------------------------------------------
-# AEC/AGC – simple proportional controller
-# ---------------------------------------------------------------------------
+# ==============================================================================
+# AEC / AGC
+# ==============================================================================
 class AEController:
-    """
-    Simple proportional AE controller.
+    def __init__(self, target=100.0, tol=8.0, max_exp_us=33000.0,
+                 max_ana=8.0, max_dig=4.0, k=0.3):
+        self.target  = target
+        self.tol     = tol
+        self.max_exp = max_exp_us
+        self.max_ana = max_ana
+        self.max_dig = max_dig
+        self.k       = k
 
-    Strategy:
-      1. First fill exposure up to a soft ceiling (max_exposure_us).
-      2. Then ramp analog gain [1×, max_analog_gain].
-      3. Finally, if still too dark, apply digital gain [1×, max_digital_gain].
-      4. When brightening scene: reverse order (reduce digital → reduce analog
-         → reduce exposure).
-    """
-
-    def __init__(self,
-                 target_brightness: float = 100.0,  # out of 255
-                 tolerance: float = 8.0,
-                 max_exposure_us: float = 33_000.0,   # ~1 frame @ 30fps
-                 max_analog_gain: float = 8.0,
-                 max_digital_gain: float = 4.0,
-                 proportional_k: float = 0.3):
-        self.target      = target_brightness
-        self.tolerance   = tolerance
-        self.max_exp_us  = max_exposure_us
-        self.max_ana     = max_analog_gain
-        self.max_dig     = max_digital_gain
-        self.k           = proportional_k
-
-    def measure_brightness(self, bgr: np.ndarray) -> float:
-        """Average luminance of the central 60% of the frame."""
+    @staticmethod
+    def measure(bgr):
         h, w = bgr.shape[:2]
-        y0, y1 = int(h * 0.2), int(h * 0.8)
-        x0, x1 = int(w * 0.2), int(w * 0.8)
-        roi = bgr[y0:y1, x0:x1]
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        return float(np.mean(gray))
+        roi  = bgr[int(h*.2):int(h*.8), int(w*.2):int(w*.8)]
+        return float(np.mean(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)))
 
-    def update(self, brightness: float, ctrl: IMX219Controller):
-        """Adjust sensor registers to drive brightness toward target."""
-        error = self.target - brightness
-        if abs(error) < self.tolerance:
-            return   # within dead-band, no action
+    def step(self, brt, ctrl):
+        err = self.target - brt
+        if abs(err) < self.tol:
+            return
+        ratio = 1.0 + self.k * err / self.target
 
-        ratio = 1.0 + self.k * error / self.target   # multiplicative step
-
-        if ratio > 1.0:   # need more light
-            # 1) increase exposure first
+        if ratio > 1.0:
             new_exp = ctrl.exposure_us * ratio
-            if new_exp <= self.max_exp_us:
-                ctrl.exposure_us = new_exp
-                return
-            ctrl.exposure_us = self.max_exp_us
-            leftover = new_exp / self.max_exp_us
-            # 2) then analog gain
-            new_ana = ctrl.analog_gain * leftover
+            if new_exp <= self.max_exp:
+                ctrl.exposure_us = new_exp; return
+            ctrl.exposure_us = self.max_exp
+            r2 = new_exp / self.max_exp
+            new_ana = ctrl.analog_gain * r2
             if new_ana <= self.max_ana:
-                ctrl.analog_gain = new_ana
-                return
+                ctrl.analog_gain = new_ana; return
             ctrl.analog_gain = self.max_ana
-            leftover2 = new_ana / self.max_ana
-            # 3) finally digital gain
-            ctrl.digital_gain = min(ctrl.digital_gain * leftover2,
+            ctrl.digital_gain = min(ctrl.digital_gain * (new_ana / self.max_ana),
                                     self.max_dig)
-        else:             # reduce light
-            # reverse: reduce digital first
+        else:
             new_dig = ctrl.digital_gain * ratio
             if new_dig >= 1.0:
-                ctrl.digital_gain = new_dig
-                return
+                ctrl.digital_gain = new_dig; return
             ctrl.digital_gain = 1.0
-            leftover = ctrl.digital_gain * ratio   # extra reduction needed
-            # then analog
             new_ana = ctrl.analog_gain * ratio
             if new_ana >= 1.0:
-                ctrl.analog_gain = new_ana
-                return
+                ctrl.analog_gain = new_ana; return
             ctrl.analog_gain = 1.0
-            # finally shorten exposure
-            ctrl.exposure_us = max(ctrl.exposure_us * ratio,
-                                   EXPOSURE_MIN * IMX219Controller.LINE_TIME_US)
+            min_exp = EXPOSURE_MIN * IMX219Controller.LINE_TIME_US
+            ctrl.exposure_us = max(ctrl.exposure_us * ratio, min_exp)
 
 
-# ---------------------------------------------------------------------------
-# Main capture + tuning loop
-# ---------------------------------------------------------------------------
+# ==============================================================================
+# Main loop
+# ==============================================================================
 def run(args):
-    # -----------------------------------------------------------------------
-    # Open V4L2 device
-    # -----------------------------------------------------------------------
-    cap = cv2.VideoCapture(args.device, cv2.CAP_V4L2)
-    if not cap.isOpened():
-        print(f"[ERROR] Cannot open {args.device}")
-        sys.exit(1)
-
-    # Request RAW / uncompressed format; the sensor is already streaming RAW8
-    # so we just set the resolution.  If your pipeline delivers already-debayered
-    # frames via the ISP you can skip the manual debayer step below.
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  args.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    # Disable any built-in auto-exposure / auto-gain that OpenCV or V4L2 may
-    # have enabled by default (exposure_auto = 1 means manual on V4L2)
-    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
-
-    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"[CAP] Opened {args.device} at {actual_w}×{actual_h}")
-
-    # -----------------------------------------------------------------------
-    # I2C + sensor controller
-    # -----------------------------------------------------------------------
-    i2c  = IMX219I2C(args.i2c_bus)
-    if HAS_SMBUS:
-        i2c.verify_chip_id()
+    cap  = TegraCapture(args.device, args.width, args.height)
+    i2c  = IMX219I2C(args.i2c_bus, args.i2c_addr)
     ctrl = IMX219Controller(i2c)
+    ae   = AEController(target=args.target_brightness)
 
-    ae   = AEController(target_brightness=args.target_brightness)
+    awb       = [1.0, 1.0, 1.0]   # [gr, gg, gb]
+    alpha     = 0.05
+    frame_n   = 0
+    save_next = False
 
-    # Persistent AWB gains (smoothed over frames)
-    awb_gr, awb_gg, awb_gb = 1.0, 1.0, 1.0
-    awb_alpha = 0.05     # EMA smoothing – lower = more stable but slower
-
-    print("\nControls while running:")
-    print("  q / ESC  – quit")
-    print("  r        – reset gains to default")
-    print("  s        – save current frame as PNG")
-    print("  p        – print current sensor state\n")
-
-    frame_count = 0
-    save_next   = False
+    print("\nKeys (window must have focus):")
+    print("  q/ESC quit  |  r reset  |  s save frame  |  p print state\n")
 
     while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("[WARN] Failed to grab frame")
-            time.sleep(0.01)
+        raw = cap.read()
+        if raw is None:
             continue
+        frame_n += 1
 
-        frame_count += 1
+        raw_bl = subtract_black(raw)
+        bgr    = debayer(raw_bl)
 
-        # -------------------------------------------------------------------
-        # If the driver hands us a single-channel (RAW8 Bayer) frame we need
-        # to process it ourselves.  If it already arrives as BGR (ISP demosaiced)
-        # we skip debayer.
-        # -------------------------------------------------------------------
-        if frame.ndim == 2 or (frame.ndim == 3 and frame.shape[2] == 1):
-            # True RAW8 path
-            raw = frame if frame.ndim == 2 else frame[:, :, 0]
-            raw = subtract_black_level(raw, BAYER_BLACK_LEVEL_RAW8)
-            bgr = debayer(raw)
-            is_raw = True
-        else:
-            # Demosaiced path (ISP active, or camera already outputs BGR)
-            bgr = frame
-            is_raw = False
-
-        # -------------------------------------------------------------------
-        # AEC/AGC  (every frame)
-        # -------------------------------------------------------------------
         if not args.no_aec:
-            brightness = ae.measure_brightness(bgr)
-            ae.update(brightness, ctrl)
+            brt = ae.measure(bgr)
+            ae.step(brt, ctrl)
 
-        # -------------------------------------------------------------------
-        # AWB  (every 5 frames to reduce flicker)
-        # -------------------------------------------------------------------
-        if not args.no_awb and frame_count % 5 == 0:
-            gr, gg, gb = gray_world_awb(bgr)
-            # Clamp gains to sane range [0.5, 3.0]
+        if not args.no_awb and frame_n % 5 == 0:
+            gr, gg, gb = gray_world_gains(bgr)
             gr = float(np.clip(gr, 0.5, 3.0))
             gb = float(np.clip(gb, 0.5, 3.0))
-            # EMA smoothing
-            awb_gr = awb_alpha * gr + (1 - awb_alpha) * awb_gr
-            awb_gg = awb_alpha * gg + (1 - awb_alpha) * awb_gg
-            awb_gb = awb_alpha * gb + (1 - awb_alpha) * awb_gb
+            awb[0] = alpha * gr + (1 - alpha) * awb[0]
+            awb[2] = alpha * gb + (1 - alpha) * awb[2]
 
-        bgr_wb = apply_awb_gains(bgr, awb_gr, awb_gg, awb_gb)
+        bgr_wb = apply_gains(bgr, *awb)
 
-        # -------------------------------------------------------------------
-        # OSD overlay
-        # -------------------------------------------------------------------
-        disp = bgr_wb.copy()
-        brt  = ae.measure_brightness(disp)
-        lines = [
-            f"Frame: {frame_count}",
-            f"Brightness: {brt:.1f} / target {args.target_brightness}",
-            f"AnaGain: {ctrl.analog_gain:.2f}x (code {ctrl.ana_gain_code})",
-            f"DigGain: {ctrl.digital_gain:.2f}x",
-            f"Exposure: {ctrl.exposure_us:.0f} us ({ctrl.exposure_lines} lines)",
-            f"AWB  R={awb_gr:.3f} G={awb_gg:.3f} B={awb_gb:.3f}",
-        ]
-        for i, txt in enumerate(lines):
-            cv2.putText(disp, txt, (10, 20 + i * 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1,
-                        cv2.LINE_AA)
-
-        # Resize for display if very large
-        disp_h, disp_w = disp.shape[:2]
-        max_display = 1280
-        if disp_w > max_display:
-            scale = max_display / disp_w
-            disp = cv2.resize(disp,
-                              (int(disp_w * scale), int(disp_h * scale)))
-
-        cv2.imshow("IMX219 Tuning", disp)
-
-        # -------------------------------------------------------------------
-        # Save
-        # -------------------------------------------------------------------
         if save_next:
-            fname = f"imx219_frame_{frame_count:05d}.png"
+            fname = f"imx219_{frame_n:05d}.png"
             cv2.imwrite(fname, bgr_wb)
             print(f"[SAVE] {fname}")
             save_next = False
 
-        # -------------------------------------------------------------------
-        # Key handling
-        # -------------------------------------------------------------------
+        disp = bgr_wb.copy()
+        brt  = ae.measure(disp)
+        osd  = [
+            f"Frame {frame_n}",
+            f"Brightness: {brt:.1f} / target {args.target_brightness}",
+            f"AnaGain : {ctrl.analog_gain:.2f}x  (code {ctrl.ana_code})",
+            f"DigGain : {ctrl.digital_gain:.2f}x  (0x{ctrl.dig_code:04X})",
+            f"Exposure: {ctrl.exposure_us:.0f} us  ({ctrl.exposure_lines} lines)",
+            f"AWB  R={awb[0]:.3f}  G={awb[1]:.3f}  B={awb[2]:.3f}",
+        ]
+        for i, t in enumerate(osd):
+            cv2.putText(disp, t, (10, 22 + i * 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1,
+                        cv2.LINE_AA)
+
+        dh, dw = disp.shape[:2]
+        if dw > 1280:
+            s = 1280 / dw
+            disp = cv2.resize(disp, (int(dw * s), int(dh * s)))
+
+        cv2.imshow("IMX219 Tuning", disp)
+
         key = cv2.waitKey(1) & 0xFF
-        if key in (ord('q'), 27):      # q or ESC
+        if key in (ord('q'), 27):
             break
         elif key == ord('r'):
-            ctrl.ana_gain_code  = ANA_GAIN_DEFAULT
-            ctrl.dig_gain_code  = DIG_GAIN_DEFAULT
-            ctrl.exposure_lines = EXPOSURE_DEFAULT
-            ctrl._apply()
-            awb_gr = awb_gg = awb_gb = 1.0
-            print("[RESET] Gains and exposure reset to defaults")
+            ctrl.reset()
+            awb[:] = [1.0, 1.0, 1.0]
+            print("[RESET]")
         elif key == ord('s'):
             save_next = True
         elif key == ord('p'):
             ctrl.print_state()
-            print(f"  AWB gains    : R={awb_gr:.3f}  G={awb_gg:.3f}  "
-                  f"B={awb_gb:.3f}")
-            print(f"  Brightness   : {ae.measure_brightness(bgr):.1f}")
+            print(f"  AWB  R={awb[0]:.3f}  G={awb[1]:.3f}  B={awb[2]:.3f}")
+            print(f"  Brightness: {ae.measure(bgr):.1f}")
 
     cap.release()
     cv2.destroyAllWindows()
@@ -529,31 +536,22 @@ def run(args):
     print("[DONE]")
 
 
-# ---------------------------------------------------------------------------
+# ==============================================================================
 # CLI
-# ---------------------------------------------------------------------------
-def build_parser():
-    p = argparse.ArgumentParser(
-        description="IMX219 RAW8 camera tuning – AWB / AEC / Black-level")
-    p.add_argument("--device",  default="/dev/video0",
-                   help="V4L2 device node (default: /dev/video0)")
-    p.add_argument("--i2c-bus", type=int, default=10,
-                   help="I2C bus number for sensor register access "
-                        "(default: 10, adjust for your platform)")
-    p.add_argument("--width",   type=int, default=1920,
-                   help="Capture width  (default: 1920)")
-    p.add_argument("--height",  type=int, default=1080,
-                   help="Capture height (default: 1080)")
-    p.add_argument("--target-brightness", type=float, default=100.0,
-                   help="AE target mean luminance 0–255 (default: 100)")
-    p.add_argument("--no-awb",  action="store_true",
-                   help="Disable automatic white balance")
-    p.add_argument("--no-aec",  action="store_true",
-                   help="Disable automatic exposure / gain control")
-    return p
+# ==============================================================================
+def _parse():
+    p = argparse.ArgumentParser(description="IMX219 RAW8 tuning - Jetson/Tegra VI")
+    p.add_argument("--device",   default="/dev/video5")
+    p.add_argument("--i2c-bus",  type=int, default=1)
+    p.add_argument("--i2c-addr", type=lambda x: int(x, 0), default=0x08,
+                   help="Sensor I2C address (default 0x08 from 'cam_v1 1-0008')")
+    p.add_argument("--width",    type=int, default=1920)
+    p.add_argument("--height",   type=int, default=1080)
+    p.add_argument("--target-brightness", type=float, default=100.0)
+    p.add_argument("--no-awb",   action="store_true")
+    p.add_argument("--no-aec",   action="store_true")
+    return p.parse_args()
 
 
 if __name__ == "__main__":
-    args = build_parser().parse_args()
-    run(args)
-
+    run(_parse())
