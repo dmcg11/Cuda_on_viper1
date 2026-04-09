@@ -576,6 +576,7 @@ def run(args):
     fps_count = 0
     sr        = {s: 0.0 for s in _STAGES}  # stage report
     last_brt  = 120.0  # last measured brightness (updated every 5 frames)
+    c         = get_controls()  # initialise controls before loop
 
     print("\nKeys (camera window must have focus):")
     print("  q/ESC quit  |  s save snapshot.jpg  |  w save raw Bayer  |  r reset  |  p print state\n")
@@ -590,6 +591,7 @@ def run(args):
         frame_n   += 1
         fps_count += 1
         now = time.time()
+        _pt['overhead'] = _pt.get('overhead', 0.0)  # init if missing
         if now - fps_t0 >= 1.0:
             fps = fps_count / (now - fps_t0)
             fps_count = 0
@@ -602,7 +604,9 @@ def run(args):
             _pt['denoise'] = 0.0
             sr = record_stage_report()
             show_ms = _pt.get('show', 0.0) / n * 1000
+            ovh_ms  = _pt.get('overhead', 0.0) / n * 1000
             _pt['show'] = 0.0
+            _pt['overhead'] = 0.0
             print(f"[PERF] FPS:{fps:.1f}  "
                   f"cap:{sr['capture']:.1f}  "
                   f"pre:{pre_ms:.1f}  "
@@ -612,10 +616,13 @@ def run(args):
                   f"shp:{sr['sharp']:.1f}  "
                   f"den:{den_ms:.1f}  "
                   f"show:{show_ms:.1f}  "
+                  f"key:{ovh_ms:.1f}  "
                   f"tot:{sr['total']:.1f}  ms/frame")
 
-        c = get_controls()
-        ae.target = c['ae_tgt']
+        # Read trackbars every 3 frames — each read is a GTK IPC call
+        if frame_n % 3 == 0:
+            c = get_controls()
+            ae.target = c['ae_tgt']
 
         # Rough debayer only every 5 frames — AEC reuses last brightness measurement
         # Subsample Bayer by 4x (every 4th pixel) for a tiny 480x270 image
@@ -696,7 +703,10 @@ def run(args):
         cv2.imshow("IMX219 Tuning", disp)
         _pt['show'] = _pt.get('show', 0.0) + (time.perf_counter() - t_show)
 
-        key = cv2.waitKey(1) & 0xFF
+        # pollKey() is non-blocking unlike waitKey(1) which sleeps on GTK
+        t_key = time.perf_counter()
+        key = cv2.pollKey() & 0xFF
+        _pt['overhead'] = _pt.get('overhead', 0.0) + (time.perf_counter() - t_key)
         if key in (ord('q'), 27):
             break
         elif key == ord('s'):
