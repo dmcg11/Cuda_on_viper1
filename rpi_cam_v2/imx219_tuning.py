@@ -360,12 +360,11 @@ def process_frame(raw: np.ndarray, p: dict, full_res: bool = False) -> np.ndarra
         bgr  = np.clip(bgrf, 0, 255).astype(np.uint8)
     t4 = t(); _pt['ccm'] += t4 - t3
 
-    # 6. Saturation — RGB formula (no HSV round-trip): ~3x faster
-    # out = gray + sat * (pixel - gray),  gray = luma
-    if abs(sat - 1.0) > 0.02:
-        f    = bgr.astype(np.float32)
-        luma = (0.114 * f[:,:,0] + 0.587 * f[:,:,1] + 0.299 * f[:,:,2])[:,:,np.newaxis]
-        bgr  = np.clip(luma + sat * (f - luma), 0, 255).astype(np.uint8)
+    # 6. Saturation via HSV S-channel LUT (skipped when sat==1.0 or sat==0)
+    if sat > 0.01 and abs(sat - 1.0) > 0.02:
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        hsv[:,:,1] = cv2.LUT(hsv[:,:,1], _sat_lut(sat))
+        bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
     t5 = t(); _pt['sat'] += t5 - t4
 
     # 7. Unsharp mask — fixed 5x5 kernel is ~4x faster than auto-sigma (0,0)
@@ -418,7 +417,7 @@ def create_controls():
     cv2.createTrackbar("Black Level",       CTRL_WIN,  16,  64, lambda x: None)
     cv2.createTrackbar("CCM Strength x100", CTRL_WIN, 100, 100, lambda x: None)
     cv2.createTrackbar("Gamma x100",        CTRL_WIN, 220, 400, lambda x: None)
-    cv2.createTrackbar("Saturation x100",   CTRL_WIN, 130, 300, lambda x: None)
+    cv2.createTrackbar("Saturation x100",   CTRL_WIN, 100, 300, lambda x: None)
     cv2.createTrackbar("Sharpness x100",    CTRL_WIN,  50, 200, lambda x: None)
     cv2.createTrackbar("Denoise (1=on)",    CTRL_WIN,   0,   1, lambda x: None)
     cv2.createTrackbar("Auto Exp (1=on)",   CTRL_WIN,   1,   1, lambda x: None)
@@ -435,7 +434,7 @@ def get_controls() -> dict:
         'bl':       tb("Black Level"),
         'ccm_s':    tb("CCM Strength x100") / 100.0,
         'gamma':    max(tb("Gamma x100"), 10) / 100.0,
-        'sat':      max(tb("Saturation x100"), 1) / 100.0,
+        'sat':      tb("Saturation x100") / 100.0,
         'sharp':    tb("Sharpness x100") / 100.0,
         'denoise':  tb("Denoise (1=on)") == 1,
         'auto_aec': tb("Auto Exp (1=on)") == 1,
@@ -488,8 +487,11 @@ def run(args):
             fps_count = 0
             fps_t0    = now
             sr = record_stage_report()
+            pre_ms = _pt.get('pre', 0.0) / max(_ptc[0], 1) * 1000
+            _pt['pre'] = 0.0
             print(f"[PERF] FPS:{fps:.1f}  "
                   f"cap:{sr['capture']:.1f}  "
+                  f"pre:{pre_ms:.1f}  "
                   f"deb:{sr['debayer']:.1f}  "
                   f"rsz:{sr['resize']:.1f}  "
                   f"lut:{sr['lut']:.1f}  "
@@ -501,11 +503,13 @@ def run(args):
         c = get_controls()
         ae.target = c['ae_tgt']
 
-        # Half-res debayer shared by AEC + AWB (avoids a second full-res pass)
+        # Half-res rough debayer for AEC + AWB
+        t_pre = time.perf_counter()
         raw_s = cv2.resize(raw, (raw.shape[1] // 2, raw.shape[0] // 2),
                            interpolation=cv2.INTER_NEAREST)
         raw_s = np.clip(raw_s.astype(np.int16) - c['bl'], 0, 255).astype(np.uint8)
         rough = cv2.cvtColor(raw_s, cv2.COLOR_BayerRG2BGR)
+        _pt['pre'] = _pt.get('pre', 0.0) + (time.perf_counter() - t_pre)
 
         if c['auto_aec']:
             ae.step(ae.measure(rough), ctrl)
