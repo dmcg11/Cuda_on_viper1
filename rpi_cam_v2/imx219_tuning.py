@@ -357,9 +357,15 @@ def process_frame(raw: np.ndarray, p: dict, full_res: bool = False) -> np.ndarra
         _pt['debayer'] += t() - t1
         _pt['resize']  += 0.0
     else:
-        # 2x2 Bayer bin BEFORE debayer: 1920x1080 -> 960x540, preserves RGGB pattern
-        # This is 4x fewer pixels to debayer — the single biggest speedup
-        raw_half = raw_bl[::2, ::2]
+        # Correct 2x Bayer subsample: interleave R/Gr/Gb/B from every 2nd quad
+        # raw[::2, ::2] is WRONG — it only takes R pixels (monochrome result)
+        # Correct: take one of each color from each 2x2 Bayer quad
+        h2, w2 = raw_bl.shape[0]//2, raw_bl.shape[1]//2
+        raw_half = np.empty((h2, w2), dtype=np.uint8)
+        raw_half[0::2, 0::2] = raw_bl[0::4, 0::4]  # R  (rows 0,4,8... cols 0,4,8...)
+        raw_half[0::2, 1::2] = raw_bl[0::4, 1::4]  # Gr (rows 0,4,8... cols 1,5,9...)
+        raw_half[1::2, 0::2] = raw_bl[1::4, 0::4]  # Gb (rows 1,5,9... cols 0,4,8...)
+        raw_half[1::2, 1::2] = raw_bl[1::4, 1::4]  # B  (rows 1,5,9... cols 1,5,9...)
         t2 = t(); _pt['resize'] += t2 - t1
         bgr = _debayer_cuda(raw_half) if HAS_CUDA else _debayer_cpu(raw_half)
         _pt['debayer'] += t() - t2
@@ -482,7 +488,8 @@ def run(args):
     awb       = [1.60, 1.0, 1.40]  # IMX219 is green-dominant; pre-correct R and B up
     alpha     = 0.05
     frame_n   = 0
-    save_next = False
+    save_next     = False
+    save_raw_next = False
     fps       = 0.0
     fps_t0    = time.time()
     fps_count = 0
@@ -490,7 +497,7 @@ def run(args):
     last_brt  = 120.0  # last measured brightness (updated every 5 frames)
 
     print("\nKeys (camera window must have focus):")
-    print("  q/ESC quit  |  s save snapshot.jpg  |  r reset  |  p print state\n")
+    print("  q/ESC quit  |  s save snapshot.jpg  |  w save raw Bayer  |  r reset  |  p print state\n")
 
     while True:
         t_cap0 = time.perf_counter()
@@ -527,7 +534,14 @@ def run(args):
         # Subsample Bayer by 4x (every 4th pixel) for a tiny 480x270 image
         if frame_n % 5 == 0:
             t_pre = time.perf_counter()
-            raw_tiny = np.clip(raw[::4, ::4].astype(np.int16) - c['bl'], 0, 255).astype(np.uint8)
+            # Correct 4x Bayer subsample (480x270) — preserve all four channels
+            rbl = np.clip(raw.astype(np.int16) - c['bl'], 0, 255).astype(np.uint8)
+            h4, w4 = rbl.shape[0]//4, rbl.shape[1]//4
+            raw_tiny = np.empty((h4, w4), dtype=np.uint8)
+            raw_tiny[0::2, 0::2] = rbl[0::8, 0::8]  # R
+            raw_tiny[0::2, 1::2] = rbl[0::8, 1::8]  # Gr
+            raw_tiny[1::2, 0::2] = rbl[1::8, 0::8]  # Gb
+            raw_tiny[1::2, 1::2] = rbl[1::8, 1::8]  # B
             rough = cv2.cvtColor(raw_tiny, cv2.COLOR_BayerRG2BGR)
             last_brt = ae.measure(rough)
             _pt['pre'] = _pt.get('pre', 0.0) + (time.perf_counter() - t_pre)
@@ -557,6 +571,11 @@ def run(args):
             cv2.imwrite("snapshot.jpg", full, [cv2.IMWRITE_JPEG_QUALITY, 95])
             print("[SAVE] snapshot.jpg  (full res)")
             save_next = False
+
+        if save_raw_next:
+            cv2.imwrite("snapshot_raw.png", raw)
+            print("[SAVE] snapshot_raw.png  (RAW8 Bayer, no processing)")
+            save_raw_next = False
 
         # OSD
         t_d0 = time.perf_counter()
@@ -588,6 +607,8 @@ def run(args):
             break
         elif key == ord('s'):
             save_next = True
+        elif key == ord('w'):
+            save_raw_next = True
         elif key == ord('r'):
             ctrl.reset()
             awb[:] = [1.60, 1.0, 1.40]
