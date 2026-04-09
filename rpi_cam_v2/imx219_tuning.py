@@ -360,16 +360,17 @@ def process_frame(raw: np.ndarray, p: dict, full_res: bool = False) -> np.ndarra
         bgr  = np.clip(bgrf, 0, 255).astype(np.uint8)
     t4 = t(); _pt['ccm'] += t4 - t3
 
-    # 6. Saturation via HSV S-channel LUT
+    # 6. Saturation — RGB formula (no HSV round-trip): ~3x faster
+    # out = gray + sat * (pixel - gray),  gray = luma
     if abs(sat - 1.0) > 0.02:
-        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-        hsv[:, :, 1] = cv2.LUT(hsv[:, :, 1], _sat_lut(sat))
-        bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+        f    = bgr.astype(np.float32)
+        luma = (0.114 * f[:,:,0] + 0.587 * f[:,:,1] + 0.299 * f[:,:,2])[:,:,np.newaxis]
+        bgr  = np.clip(luma + sat * (f - luma), 0, 255).astype(np.uint8)
     t5 = t(); _pt['sat'] += t5 - t4
 
-    # 7. Unsharp mask sharpening
+    # 7. Unsharp mask — fixed 5x5 kernel is ~4x faster than auto-sigma (0,0)
     if sharp > 0.02:
-        blur = cv2.GaussianBlur(bgr, (0, 0), 2.0)
+        blur = cv2.GaussianBlur(bgr, (5, 5), 0)
         bgr  = cv2.addWeighted(bgr, 1.0 + sharp, blur, -sharp, 0)
 
     # 8. Denoise (very slow — off by default)
@@ -460,7 +461,7 @@ def run(args):
 
     create_controls()
 
-    awb       = [1.10, 1.0, 0.85]
+    awb       = [1.60, 1.0, 1.40]  # IMX219 is green-dominant; pre-correct R and B up
     alpha     = 0.05
     frame_n   = 0
     save_next = False
@@ -563,7 +564,7 @@ def run(args):
             save_next = True
         elif key == ord('r'):
             ctrl.reset()
-            awb[:] = [1.10, 1.0, 0.85]
+            awb[:] = [1.60, 1.0, 1.40]
             sync_awb(*awb)
             print("[RESET]")
         elif key == ord('p'):
