@@ -188,8 +188,8 @@ class IMX219Controller:
 # AEC / AGC
 # ==============================================================================
 class AEController:
-    def __init__(self, target=120.0, tol=8.0, max_exp_us=33000.0,
-                 max_ana=8.0, max_dig=4.0, k=0.3):
+    def __init__(self, target=120.0, tol=12.0, max_exp_us=33000.0,
+                 max_ana=8.0, max_dig=4.0, k=0.10):
         self.target  = target
         self.tol     = tol
         self.max_exp = max_exp_us
@@ -206,7 +206,9 @@ class AEController:
     def step(self, brt, ctrl):
         err = self.target - brt
         if abs(err) < self.tol: return
+        # Clamp ratio to ±20% per step to prevent overshoot oscillation
         ratio = 1.0 + self.k * err / self.target
+        ratio = float(np.clip(ratio, 0.80, 1.20))
         if ratio > 1.0:
             new_exp = ctrl.exposure_us * ratio
             if new_exp <= self.max_exp: ctrl.exposure_us = new_exp; return
