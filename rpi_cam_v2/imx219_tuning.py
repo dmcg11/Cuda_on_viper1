@@ -399,9 +399,9 @@ def process_frame(raw: np.ndarray, p: dict, full_res: bool = False) -> np.ndarra
         bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
     t5 = t(); _pt['sat'] += t5 - t4
 
-    # 7. Unsharp mask — fixed 5x5 kernel is ~4x faster than auto-sigma (0,0)
+    # 7. Unsharp mask — 3x3 kernel, fastest option that still looks good
     if sharp > 0.02:
-        blur = cv2.GaussianBlur(bgr, (5, 5), 0)
+        blur = cv2.GaussianBlur(bgr, (3, 3), 0)
         bgr  = cv2.addWeighted(bgr, 1.0 + sharp, blur, -sharp, 0)
 
     # 8. Denoise — bilateral filter (~5ms vs ~700ms for NLM)
@@ -605,16 +605,17 @@ def run(args):
 
         # Rough debayer only every 5 frames — AEC reuses last brightness measurement
         # Subsample Bayer by 4x (every 4th pixel) for a tiny 480x270 image
-        if frame_n % 5 == 0:
+        if frame_n % 10 == 0:
             t_pre = time.perf_counter()
-            # Correct 4x Bayer subsample (480x270) — preserve all four channels
+            # 8x subsample Bayer: produces 240x135 image, enough for AEC+AWB
+            # Interleave all 4 Bayer channels correctly (RGGB preserved)
             rbl = np.clip(raw.astype(np.int16) - c['bl'], 0, 255).astype(np.uint8)
-            h4, w4 = rbl.shape[0]//4, rbl.shape[1]//4
-            raw_tiny = np.empty((h4, w4), dtype=np.uint8)
-            raw_tiny[0::2, 0::2] = rbl[0::8, 0::8]  # R
-            raw_tiny[0::2, 1::2] = rbl[0::8, 1::8]  # Gr
-            raw_tiny[1::2, 0::2] = rbl[1::8, 0::8]  # Gb
-            raw_tiny[1::2, 1::2] = rbl[1::8, 1::8]  # B
+            h8, w8 = rbl.shape[0]//8, rbl.shape[1]//8
+            raw_tiny = np.empty((h8*2, w8*2), dtype=np.uint8)
+            raw_tiny[0::2, 0::2] = rbl[0::16, 0::16]   # R
+            raw_tiny[0::2, 1::2] = rbl[0::16,  1::16]  # Gr
+            raw_tiny[1::2, 0::2] = rbl[1::16,  0::16]  # Gb
+            raw_tiny[1::2, 1::2] = rbl[1::16,  1::16]  # B
             rough = cv2.cvtColor(raw_tiny, cv2.COLOR_BayerRG2BGR)
             last_brt = ae.measure(rough)
             _pt['pre'] = _pt.get('pre', 0.0) + (time.perf_counter() - t_pre)
