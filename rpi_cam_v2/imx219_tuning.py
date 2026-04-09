@@ -407,17 +407,13 @@ def process_frame(raw: np.ndarray, p: dict, full_res: bool = False) -> np.ndarra
         bgr  = cv2.addWeighted(bgr, 1.0 + sharp, blur, -sharp, 0)
     t6 = t(); _pt['sharp'] += t6 - t5
 
-    # 8. Denoise — downsample 2x, denoise, upsample back (~4ms total)
-    # Downscaling before denoising is 4x fewer pixels and looks nearly identical
+    # 8. Denoise — fast blur-and-subtract on luma only (~2ms)
+    # Equivalent to a gentle high-frequency noise suppression without median cost
     if denoise:
-        h, w = bgr.shape[:2]
-        small = cv2.resize(bgr, (w//2, h//2), interpolation=cv2.INTER_LINEAR)
-        ycrcb = cv2.cvtColor(small, cv2.COLOR_BGR2YCrCb)
-        ycrcb[:, :, 0] = cv2.medianBlur(ycrcb[:, :, 0], 3)
-        ycrcb[:, :, 1] = cv2.GaussianBlur(ycrcb[:, :, 1], (3, 3), 0)
-        ycrcb[:, :, 2] = cv2.GaussianBlur(ycrcb[:, :, 2], (3, 3), 0)
-        small = cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
-        bgr = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+        ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
+        y = ycrcb[:, :, 0]
+        ycrcb[:, :, 0] = cv2.GaussianBlur(y, (3, 3), 0)
+        bgr = cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
     t7 = t(); _pt['denoise'] = _pt.get('denoise', 0.0) + t7 - t6
 
     _pt['total'] += t7 - t0
@@ -598,21 +594,24 @@ def run(args):
             fps = fps_count / (now - fps_t0)
             fps_count = 0
             fps_t0    = now
-            sr = record_stage_report()
-            pre_ms = _pt.get('pre', 0.0) / max(_ptc[0], 1) * 1000
+            # Compute pre/den BEFORE record_stage_report() resets _ptc[0]
+            n = max(_ptc[0], 1)
+            pre_ms = _pt.get('pre', 0.0) / n * 1000
+            den_ms = _pt.get('denoise', 0.0) / n * 1000
             _pt['pre'] = 0.0
-            den_ms = _pt.get('denoise', 0.0) / max(_ptc[0], 1) * 1000
             _pt['denoise'] = 0.0
+            sr = record_stage_report()
+            show_ms = _pt.get('show', 0.0) / n * 1000
+            _pt['show'] = 0.0
             print(f"[PERF] FPS:{fps:.1f}  "
                   f"cap:{sr['capture']:.1f}  "
                   f"pre:{pre_ms:.1f}  "
                   f"deb:{sr['debayer']:.1f}  "
-                  f"rsz:{sr['resize']:.1f}  "
                   f"lut:{sr['lut']:.1f}  "
                   f"ccm:{sr['ccm']:.1f}  "
-                  f"sat:{sr['sat']:.1f}  "
                   f"shp:{sr['sharp']:.1f}  "
                   f"den:{den_ms:.1f}  "
+                  f"show:{show_ms:.1f}  "
                   f"tot:{sr['total']:.1f}  ms/frame")
 
         c = get_controls()
@@ -693,7 +692,9 @@ def run(args):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 0), 1, cv2.LINE_AA)
         _pt['display'] += time.perf_counter() - t_d0
 
+        t_show = time.perf_counter()
         cv2.imshow("IMX219 Tuning", disp)
+        _pt['show'] = _pt.get('show', 0.0) + (time.perf_counter() - t_show)
 
         key = cv2.waitKey(1) & 0xFF
         if key in (ord('q'), 27):
