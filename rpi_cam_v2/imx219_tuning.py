@@ -35,6 +35,14 @@ except ImportError:
     HAS_SMBUS = False
     print("[WARN] smbus2 not found — I2C writes disabled")
 
+try:
+    from pidng.core import PICAM2DNG
+    from pidng.camdefs import Picam2
+    HAS_PIDNG = True
+except ImportError:
+    HAS_PIDNG = False
+    print("[WARN] pidng not found — raw save will fall back to PNG. pip install pidng")
+
 # ── CUDA availability ─────────────────────────────────────────────────────────
 try:
     HAS_CUDA = cv2.cuda.getCudaEnabledDeviceCount() > 0
@@ -474,6 +482,47 @@ def sync_awb(gr, gg, gb):
 
 
 # ==============================================================================
+# DNG save helper
+# ==============================================================================
+def save_dng(raw: np.ndarray, filename: str):
+    """
+    Save a RAW8 Bayer frame as a DNG file that Darktable / Lightroom / RawTherapee
+    will recognise as a proper raw file with demosaicing options.
+
+    If pidng is not installed, falls back to lossless 16-bit PNG with a sidecar
+    .txt describing the format.
+    """
+    if HAS_PIDNG:
+        # pidng expects a 16-bit array — shift RAW8 up to 16-bit range
+        raw16 = raw.astype(np.uint16) << 8
+        try:
+            # Use PICAM2DNG which is configured for the IMX219 (same sensor as Pi Cam v2)
+            d = PICAM2DNG(Picam2())
+            d.set_raw_image(raw16)
+            d.set_exif_callback(None)
+            d.save(filename)
+            print(f"[SAVE] {filename}  (DNG, open in Darktable/Lightroom)")
+            return
+        except Exception as e:
+            print(f"[WARN] DNG save failed ({e}), falling back to PNG")
+
+    # Fallback: save as 16-bit PNG + sidecar
+    raw16 = raw.astype(np.uint16) << 8
+    png_name = filename.replace('.dng', '.png')
+    cv2.imwrite(png_name, raw16)
+    txt_name = png_name + '.txt'
+    with open(txt_name, 'w') as f:
+        f.write("RAW16 Bayer PNG\n")
+        f.write(f"Width:  {raw.shape[1]}\n")
+        f.write(f"Height: {raw.shape[0]}\n")
+        f.write("Bayer pattern: RGGB\n")
+        f.write("Black level: 16 (in RAW8 space, 4096 in RAW16)\n")
+        f.write("White level: 65535\n")
+        f.write("To debayer: cv2.cvtColor(img, cv2.COLOR_BayerRG2BGR)\n")
+    print(f"[SAVE] {png_name}  (RAW16 PNG, sidecar: {txt_name})")
+
+
+# ==============================================================================
 # Main loop
 # ==============================================================================
 def run(args):
@@ -573,8 +622,7 @@ def run(args):
             save_next = False
 
         if save_raw_next:
-            cv2.imwrite("snapshot_raw.png", raw)
-            print("[SAVE] snapshot_raw.png  (RAW8 Bayer, no processing)")
+            save_dng(raw, "snapshot_raw.dng")
             save_raw_next = False
 
         # OSD
