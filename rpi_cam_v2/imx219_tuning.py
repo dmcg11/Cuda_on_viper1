@@ -607,15 +607,20 @@ def run(args):
         # Subsample Bayer by 4x (every 4th pixel) for a tiny 480x270 image
         if frame_n % 10 == 0:
             t_pre = time.perf_counter()
-            # 8x subsample Bayer: produces 240x135 image, enough for AEC+AWB
-            # Interleave all 4 Bayer channels correctly (RGGB preserved)
             rbl = np.clip(raw.astype(np.int16) - c['bl'], 0, 255).astype(np.uint8)
-            h8, w8 = rbl.shape[0]//8, rbl.shape[1]//8
-            raw_tiny = np.empty((h8*2, w8*2), dtype=np.uint8)
-            raw_tiny[0::2, 0::2] = rbl[0::16, 0::16]   # R
-            raw_tiny[0::2, 1::2] = rbl[0::16,  1::16]  # Gr
-            raw_tiny[1::2, 0::2] = rbl[1::16,  0::16]  # Gb
-            raw_tiny[1::2, 1::2] = rbl[1::16,  1::16]  # B
+            # Extract all 4 Bayer channels at 16px stride — let numpy determine size
+            R  = rbl[0::16, 0::16]
+            Gr = rbl[0::16, 1::16]
+            Gb = rbl[1::16, 0::16]
+            B  = rbl[1::16, 1::16]
+            # Trim to common size in case dimensions aren't divisible by 16
+            hr = min(R.shape[0], Gr.shape[0], Gb.shape[0], B.shape[0])
+            wr = min(R.shape[1], Gr.shape[1], Gb.shape[1], B.shape[1])
+            raw_tiny = np.empty((hr*2, wr*2), dtype=np.uint8)
+            raw_tiny[0::2, 0::2] = R[:hr, :wr]
+            raw_tiny[0::2, 1::2] = Gr[:hr, :wr]
+            raw_tiny[1::2, 0::2] = Gb[:hr, :wr]
+            raw_tiny[1::2, 1::2] = B[:hr, :wr]
             rough = cv2.cvtColor(raw_tiny, cv2.COLOR_BayerRG2BGR)
             last_brt = ae.measure(rough)
             _pt['pre'] = _pt.get('pre', 0.0) + (time.perf_counter() - t_pre)
