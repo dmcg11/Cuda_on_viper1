@@ -189,7 +189,7 @@ class IMX219Controller:
 # ==============================================================================
 class AEController:
     def __init__(self, target=120.0, tol=12.0, max_exp_us=33000.0,
-                 max_ana=8.0, max_dig=4.0, k=0.10):
+                 max_ana=8.0, max_dig=2.0, k=0.10):
         self.target  = target
         self.tol     = tol
         self.max_exp = max_exp_us
@@ -407,11 +407,13 @@ def process_frame(raw: np.ndarray, p: dict, full_res: bool = False) -> np.ndarra
         bgr  = cv2.addWeighted(bgr, 1.0 + sharp, blur, -sharp, 0)
     t6 = t(); _pt['sharp'] += t6 - t5
 
-    # 8. Denoise — luma-only Gaussian blur in YCrCb (~2ms)
-    # Only blurs the Y (luma) channel so color detail is preserved
+    # 8. Denoise — luma median + chroma Gaussian in YCrCb (~3ms)
+    # Median on Y removes impulse/shot noise; Gaussian on CrCb smooths color noise
     if denoise:
         ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
-        ycrcb[:, :, 0] = cv2.GaussianBlur(ycrcb[:, :, 0], (5, 5), 0)
+        ycrcb[:, :, 0] = cv2.medianBlur(ycrcb[:, :, 0], 3)          # luma: median
+        ycrcb[:, :, 1] = cv2.GaussianBlur(ycrcb[:, :, 1], (5, 5), 0) # Cr: smooth
+        ycrcb[:, :, 2] = cv2.GaussianBlur(ycrcb[:, :, 2], (5, 5), 0) # Cb: smooth
         bgr = cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
     t7 = t(); _pt['denoise'] = _pt.get('denoise', 0.0) + t7 - t6
 
@@ -457,7 +459,7 @@ def create_controls():
     cv2.createTrackbar("Gamma x100",        CTRL_WIN, 220, 400, lambda x: None)
     cv2.createTrackbar("Saturation x100",   CTRL_WIN, 100, 300, lambda x: None)
     cv2.createTrackbar("Sharpness x100",    CTRL_WIN,  50, 200, lambda x: None)
-    cv2.createTrackbar("Denoise (1=on)",    CTRL_WIN,   0,   1, lambda x: None)
+    cv2.createTrackbar("Denoise (1=on)",    CTRL_WIN,   1,   1, lambda x: None)
     cv2.createTrackbar("Auto Exp (1=on)",   CTRL_WIN,   1,   1, lambda x: None)
     cv2.createTrackbar("AE Target",         CTRL_WIN, 120, 255, lambda x: None)
 
