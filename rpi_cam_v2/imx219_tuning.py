@@ -564,6 +564,8 @@ def run(args):
     ae   = AEController(target=120.0)
 
     create_controls()
+    cv2.namedWindow("IMX219 Tuning", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("IMX219 Tuning", 960, 540)
 
     awb       = [1.60, 1.0, 1.40]  # IMX219 is green-dominant; pre-correct R and B up
     alpha     = 0.05
