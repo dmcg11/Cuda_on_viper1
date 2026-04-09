@@ -468,6 +468,7 @@ def run(args):
     fps_t0    = time.time()
     fps_count = 0
     sr        = {s: 0.0 for s in _STAGES}  # stage report
+    last_brt  = 120.0  # last measured brightness (updated every 5 frames)
 
     print("\nKeys (camera window must have focus):")
     print("  q/ESC quit  |  s save snapshot.jpg  |  r reset  |  p print state\n")
@@ -503,25 +504,27 @@ def run(args):
         c = get_controls()
         ae.target = c['ae_tgt']
 
-        # Half-res rough debayer for AEC + AWB
-        t_pre = time.perf_counter()
-        raw_s = cv2.resize(raw, (raw.shape[1] // 2, raw.shape[0] // 2),
-                           interpolation=cv2.INTER_NEAREST)
-        raw_s = np.clip(raw_s.astype(np.int16) - c['bl'], 0, 255).astype(np.uint8)
-        rough = cv2.cvtColor(raw_s, cv2.COLOR_BayerRG2BGR)
-        _pt['pre'] = _pt.get('pre', 0.0) + (time.perf_counter() - t_pre)
+        # Rough debayer only every 5 frames — AEC reuses last brightness measurement
+        # Subsample Bayer by 4x (every 4th pixel) for a tiny 480x270 image
+        if frame_n % 5 == 0:
+            t_pre = time.perf_counter()
+            raw_tiny = np.clip(raw[::4, ::4].astype(np.int16) - c['bl'], 0, 255).astype(np.uint8)
+            rough = cv2.cvtColor(raw_tiny, cv2.COLOR_BayerRG2BGR)
+            last_brt = ae.measure(rough)
+            _pt['pre'] = _pt.get('pre', 0.0) + (time.perf_counter() - t_pre)
+
+            if c['auto_wb']:
+                gr, gg, gb = gray_world_gains(rough)
+                awb[0] = alpha * gr + (1 - alpha) * awb[0]
+                awb[1] = 1.0
+                awb[2] = alpha * gb + (1 - alpha) * awb[2]
+                sync_awb(*awb)
+
+        if not c['auto_wb']:
+            awb = [c['man_r'], c['man_g'], c['man_b']]
 
         if c['auto_aec']:
-            ae.step(ae.measure(rough), ctrl)
-
-        if c['auto_wb'] and frame_n % 5 == 0:
-            gr, gg, gb = gray_world_gains(rough)
-            awb[0] = alpha * gr + (1 - alpha) * awb[0]
-            awb[1] = 1.0
-            awb[2] = alpha * gb + (1 - alpha) * awb[2]
-            sync_awb(*awb)
-        elif not c['auto_wb']:
-            awb = [c['man_r'], c['man_g'], c['man_b']]
+            ae.step(last_brt, ctrl)
 
         p = {'bl': c['bl'], 'awb': awb, 'ccm_s': c['ccm_s'],
              'gamma': c['gamma'], 'sat': c['sat'],
@@ -539,7 +542,7 @@ def run(args):
         # OSD
         t_d0 = time.perf_counter()
         wb_mode = "AUTO" if c['auto_wb'] else "MAN"
-        brt = ae.measure(rough)
+        brt = last_brt
         osd = [
             f"FPS: {fps:.1f}   Frame: {frame_n}",
             f"Brightness: {brt:.0f} / target {c['ae_tgt']}",
