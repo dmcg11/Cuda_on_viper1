@@ -285,7 +285,7 @@ def _debayer_cuda(raw_u8: np.ndarray) -> np.ndarray:
         _gpu['raw']    = cv2.cuda_GpuMat(h, w, cv2.CV_8UC1)
         _gpu['bgr']    = cv2.cuda_GpuMat(h, w, cv2.CV_8UC3)
     _gpu['raw'].upload(raw_u8, _gpu['stream'])
-    cv2.cuda.demosaicing(_gpu['raw'], cv2.cuda.COLOR_BayerRGGB2BGR,
+    cv2.cuda.demosaicing(_gpu['raw'], cv2.COLOR_BayerRG2BGR,
                          _gpu['bgr'], stream=_gpu['stream'])
     _gpu['stream'].waitForCompletion()
     return _gpu['bgr'].download()
