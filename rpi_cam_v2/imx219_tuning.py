@@ -36,8 +36,7 @@ except ImportError:
     print("[WARN] smbus2 not found — I2C writes disabled")
 
 try:
-    from pidng.core import PICAM2DNG
-    from pidng.camdefs import Picam2
+    from pidng.core import RAW2DNG, DNGTags, Tag
     HAS_PIDNG = True
 except ImportError:
     HAS_PIDNG = False
@@ -405,9 +404,10 @@ def process_frame(raw: np.ndarray, p: dict, full_res: bool = False) -> np.ndarra
         blur = cv2.GaussianBlur(bgr, (5, 5), 0)
         bgr  = cv2.addWeighted(bgr, 1.0 + sharp, blur, -sharp, 0)
 
-    # 8. Denoise (very slow — off by default)
+    # 8. Denoise — bilateral filter (~5ms vs ~700ms for NLM)
+    # sigmaColor=15 preserves edges; sigmaSpace=5 is the spatial radius
     if denoise:
-        bgr = cv2.fastNlMeansDenoisingColored(bgr, None, 5, 5, 7, 21)
+        bgr = cv2.bilateralFilter(bgr, d=5, sigmaColor=20, sigmaSpace=5)
 
     t6 = t(); _pt['sharp'] += t6 - t5
     _pt['total'] += t6 - t0
@@ -489,37 +489,61 @@ def save_dng(raw: np.ndarray, filename: str):
     Save a RAW8 Bayer frame as a DNG file that Darktable / Lightroom / RawTherapee
     will recognise as a proper raw file with demosaicing options.
 
-    If pidng is not installed, falls back to lossless 16-bit PNG with a sidecar
-    .txt describing the format.
+    Uses pidng 4.0.x RAW2DNG API with IMX219-specific tags.
+    Falls back to 16-bit PNG if pidng is unavailable.
     """
+    h, w = raw.shape
+
     if HAS_PIDNG:
-        # pidng expects a 16-bit array — shift RAW8 up to 16-bit range
-        raw16 = raw.astype(np.uint16) << 8
         try:
-            # Use PICAM2DNG which is configured for the IMX219 (same sensor as Pi Cam v2)
-            d = PICAM2DNG(Picam2())
-            d.set_raw_image(raw16)
-            d.set_exif_callback(None)
-            d.save(filename)
-            print(f"[SAVE] {filename}  (DNG, open in Darktable/Lightroom)")
+            # Shift RAW8 to 16-bit (pidng expects uint16)
+            raw16 = (raw.astype(np.uint16) << 8)
+
+            # IMX219 color matrix (D65) from RPi libcamera tuning
+            # Format: [[numerator, denominator], ...] rational numbers
+            ccm1 = [
+                [ 18004, 10000], [-5760, 10000], [-2244, 10000],
+                [-3566, 10000], [ 16925, 10000], [-3359, 10000],
+                [ -950, 10000], [-6687, 10000], [ 17637, 10000],
+            ]
+
+            t = DNGTags()
+            t.set(Tag.ImageWidth,               w)
+            t.set(Tag.ImageLength,              h)
+            t.set(Tag.TileWidth,                w)
+            t.set(Tag.TileLength,               h)
+            t.set(Tag.Orientation,              1)
+            t.set(Tag.PhotometricInterpretation, 32803)   # CFA
+            t.set(Tag.SamplesPerPixel,          1)
+            t.set(Tag.BitsPerSample,            16)
+            t.set(Tag.CFARepeatPatternDim,      [2, 2])
+            t.set(Tag.CFAPattern,               [[0, 1], [1, 2]])  # RGGB
+            t.set(Tag.BlackLevel,               [4096])   # 16 << 8
+            t.set(Tag.WhiteLevel,               [65535])
+            t.set(Tag.CalibrationIlluminant1,   21)       # D65
+            t.set(Tag.ColorMatrix1,             ccm1)
+            t.set(Tag.Make,                     "Sony")
+            t.set(Tag.Model,                    "IMX219")
+            t.set(Tag.DNGVersion,               [1, 4, 0, 0])
+            t.set(Tag.DNGBackwardVersion,       [1, 2, 0, 0])
+
+            r = RAW2DNG()
+            r.options(t, path="", compress=False)
+            r.convert(raw16, filename=filename.replace(".dng", ""))
+            print(f"[SAVE] {filename}  (DNG — open in Darktable/Lightroom/RawTherapee)")
             return
         except Exception as e:
             print(f"[WARN] DNG save failed ({e}), falling back to PNG")
 
-    # Fallback: save as 16-bit PNG + sidecar
+    # Fallback: lossless 16-bit PNG + sidecar .txt
     raw16 = raw.astype(np.uint16) << 8
     png_name = filename.replace('.dng', '.png')
     cv2.imwrite(png_name, raw16)
-    txt_name = png_name + '.txt'
-    with open(txt_name, 'w') as f:
-        f.write("RAW16 Bayer PNG\n")
-        f.write(f"Width:  {raw.shape[1]}\n")
-        f.write(f"Height: {raw.shape[0]}\n")
-        f.write("Bayer pattern: RGGB\n")
-        f.write("Black level: 16 (in RAW8 space, 4096 in RAW16)\n")
-        f.write("White level: 65535\n")
-        f.write("To debayer: cv2.cvtColor(img, cv2.COLOR_BayerRG2BGR)\n")
-    print(f"[SAVE] {png_name}  (RAW16 PNG, sidecar: {txt_name})")
+    with open(png_name + '.txt', 'w') as f:
+        f.write(f"RAW16 Bayer PNG  {w}x{h}\n")
+        f.write("Bayer: RGGB  BlackLevel: 4096  WhiteLevel: 65535\n")
+        f.write("Debayer: cv2.cvtColor(img, cv2.COLOR_BayerRG2BGR)\n")
+    print(f"[SAVE] {png_name}  (RAW16 PNG fallback)")
 
 
 # ==============================================================================
