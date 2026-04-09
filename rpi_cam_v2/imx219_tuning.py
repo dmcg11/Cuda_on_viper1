@@ -407,14 +407,17 @@ def process_frame(raw: np.ndarray, p: dict, full_res: bool = False) -> np.ndarra
         bgr  = cv2.addWeighted(bgr, 1.0 + sharp, blur, -sharp, 0)
     t6 = t(); _pt['sharp'] += t6 - t5
 
-    # 8. Denoise — luma median + chroma Gaussian in YCrCb (~3ms)
-    # Median on Y removes impulse/shot noise; Gaussian on CrCb smooths color noise
+    # 8. Denoise — downsample 2x, denoise, upsample back (~4ms total)
+    # Downscaling before denoising is 4x fewer pixels and looks nearly identical
     if denoise:
-        ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
-        ycrcb[:, :, 0] = cv2.medianBlur(ycrcb[:, :, 0], 3)          # luma: median
-        ycrcb[:, :, 1] = cv2.GaussianBlur(ycrcb[:, :, 1], (5, 5), 0) # Cr: smooth
-        ycrcb[:, :, 2] = cv2.GaussianBlur(ycrcb[:, :, 2], (5, 5), 0) # Cb: smooth
-        bgr = cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
+        h, w = bgr.shape[:2]
+        small = cv2.resize(bgr, (w//2, h//2), interpolation=cv2.INTER_LINEAR)
+        ycrcb = cv2.cvtColor(small, cv2.COLOR_BGR2YCrCb)
+        ycrcb[:, :, 0] = cv2.medianBlur(ycrcb[:, :, 0], 3)
+        ycrcb[:, :, 1] = cv2.GaussianBlur(ycrcb[:, :, 1], (3, 3), 0)
+        ycrcb[:, :, 2] = cv2.GaussianBlur(ycrcb[:, :, 2], (3, 3), 0)
+        small = cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
+        bgr = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
     t7 = t(); _pt['denoise'] = _pt.get('denoise', 0.0) + t7 - t6
 
     _pt['total'] += t7 - t0
