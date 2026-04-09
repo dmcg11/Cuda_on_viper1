@@ -703,9 +703,9 @@ def run(args):
         cv2.imshow("IMX219 Tuning", disp)
         _pt['show'] = _pt.get('show', 0.0) + (time.perf_counter() - t_show)
 
-        # pollKey() is non-blocking unlike waitKey(1) which sleeps on GTK
+        # Only pump the GTK event queue every 5 frames to avoid 10-15ms GTK stall
         t_key = time.perf_counter()
-        key = cv2.pollKey() & 0xFF
+        key = (cv2.waitKey(1) & 0xFF) if frame_n % 5 == 0 else 0xFF
         _pt['overhead'] = _pt.get('overhead', 0.0) + (time.perf_counter() - t_key)
         if key in (ord('q'), 27):
             break
