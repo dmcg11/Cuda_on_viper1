@@ -399,18 +399,21 @@ def process_frame(raw: np.ndarray, p: dict, full_res: bool = False) -> np.ndarra
         bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
     t5 = t(); _pt['sat'] += t5 - t4
 
-    # 7. Unsharp mask — 3x3 kernel, fastest option that still looks good
+    # 7. Unsharp mask — 3x3 kernel
     if sharp > 0.02:
         blur = cv2.GaussianBlur(bgr, (3, 3), 0)
         bgr  = cv2.addWeighted(bgr, 1.0 + sharp, blur, -sharp, 0)
-
-    # 8. Denoise — bilateral filter (~5ms vs ~700ms for NLM)
-    # sigmaColor=15 preserves edges; sigmaSpace=5 is the spatial radius
-    if denoise:
-        bgr = cv2.bilateralFilter(bgr, d=5, sigmaColor=20, sigmaSpace=5)
-
     t6 = t(); _pt['sharp'] += t6 - t5
-    _pt['total'] += t6 - t0
+
+    # 8. Denoise — luma-only Gaussian blur in YCrCb (~2ms)
+    # Only blurs the Y (luma) channel so color detail is preserved
+    if denoise:
+        ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
+        ycrcb[:, :, 0] = cv2.GaussianBlur(ycrcb[:, :, 0], (5, 5), 0)
+        bgr = cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
+    t7 = t(); _pt['denoise'] = _pt.get('denoise', 0.0) + t7 - t6
+
+    _pt['total'] += t7 - t0
     _ptc[0] += 1
     return bgr
 
@@ -589,6 +592,8 @@ def run(args):
             sr = record_stage_report()
             pre_ms = _pt.get('pre', 0.0) / max(_ptc[0], 1) * 1000
             _pt['pre'] = 0.0
+            den_ms = _pt.get('denoise', 0.0) / max(_ptc[0], 1) * 1000
+            _pt['denoise'] = 0.0
             print(f"[PERF] FPS:{fps:.1f}  "
                   f"cap:{sr['capture']:.1f}  "
                   f"pre:{pre_ms:.1f}  "
@@ -598,6 +603,7 @@ def run(args):
                   f"ccm:{sr['ccm']:.1f}  "
                   f"sat:{sr['sat']:.1f}  "
                   f"shp:{sr['sharp']:.1f}  "
+                  f"den:{den_ms:.1f}  "
                   f"tot:{sr['total']:.1f}  ms/frame")
 
         c = get_controls()
