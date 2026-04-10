@@ -450,7 +450,7 @@ def create_controls():
     cv2.createTrackbar("AWB G x100",        CTRL_WIN, 100, 400, lambda x: None)
     cv2.createTrackbar("AWB B x100",        CTRL_WIN,  85, 400, lambda x: None)
     cv2.createTrackbar("Black Level",       CTRL_WIN,  16,  64, lambda x: None)
-    cv2.createTrackbar("CCM Strength x100", CTRL_WIN, 100, 100, lambda x: None)
+    cv2.createTrackbar("CCM Strength x100", CTRL_WIN,   0, 100, lambda x: None)
     cv2.createTrackbar("Gamma x100",        CTRL_WIN, 220, 400, lambda x: None)
     cv2.createTrackbar("Saturation x100",   CTRL_WIN, 100, 300, lambda x: None)
     cv2.createTrackbar("Sharpness x100",    CTRL_WIN,  50, 200, lambda x: None)
