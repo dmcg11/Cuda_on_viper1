@@ -650,15 +650,19 @@ def run(args):
         if not c['auto_wb']:
             awb = [c['man_r'], c['man_g'], c['man_b']]
 
-        if c['auto_aec']:
-            ae.step(last_brt, ctrl)
-
         p = {'bl': c['bl'], 'awb': awb, 'ccm_s': c['ccm_s'],
              'gamma': c['gamma'], 'sat': c['sat'],
              'sharp': c['sharp'], 'denoise': c['denoise']}
 
         # Display at half res
         disp = process_frame(raw, p, full_res=False)
+
+        # Measure brightness on the gamma-corrected display frame so AE target
+        # matches what you actually see on screen (every 5 frames is sufficient)
+        if frame_n % 5 == 0:
+            last_brt = ae.measure(disp)
+            if c['auto_aec']:
+                ae.step(last_brt, ctrl)
 
         if save_next:
             full = process_frame(raw, p, full_res=True)
