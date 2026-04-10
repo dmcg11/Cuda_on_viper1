@@ -455,6 +455,7 @@ def create_controls():
     cv2.createTrackbar("Saturation x100",   CTRL_WIN, 100, 300, lambda x: None)
     cv2.createTrackbar("Sharpness x100",    CTRL_WIN,  50, 200, lambda x: None)
     cv2.createTrackbar("Denoise (1=on)",    CTRL_WIN,   1,   1, lambda x: None)
+    cv2.createTrackbar("Temporal x10",      CTRL_WIN,   4,  10, lambda x: None)
     cv2.createTrackbar("Auto Exp (1=on)",   CTRL_WIN,   1,   1, lambda x: None)
     cv2.createTrackbar("AE Target",         CTRL_WIN, 120, 255, lambda x: None)
 
@@ -472,6 +473,7 @@ def get_controls() -> dict:
         'sat':      tb("Saturation x100") / 100.0,
         'sharp':    tb("Sharpness x100") / 100.0,
         'denoise':  tb("Denoise (1=on)") == 1,
+        'temporal': max(tb("Temporal x10"), 1) / 10.0,
         'auto_aec': tb("Auto Exp (1=on)") == 1,
         'ae_tgt':   max(tb("AE Target"), 1),
     }
@@ -573,6 +575,7 @@ def run(args):
     sr        = {s: 0.0 for s in _STAGES}  # stage report
     last_brt  = 120.0  # last measured brightness (updated every 5 frames)
     c         = get_controls()  # initialise controls before loop
+    temporal_acc = None          # EMA accumulator for temporal denoising
 
     print("\nKeys (camera window must have focus):")
     print("  q/ESC quit  |  s save snapshot.jpg  |  w save raw Bayer  |  r reset  |  p print state\n")
@@ -657,6 +660,14 @@ def run(args):
         # Display at half res
         disp = process_frame(raw, p, full_res=False)
 
+        # Temporal EMA denoising — blends current frame with previous output
+        # alpha=0.4 means 40% current frame + 60% history → noise reduced ~3x
+        # Motion causes slight ghosting; increase alpha if scene moves a lot
+        if c['denoise']:
+            alpha_t = c['temporal']   # slider: higher = less ghosting, more noise
+            temporal_acc = disp if temporal_acc is None or temporal_acc.shape != disp.shape                            else cv2.addWeighted(disp, alpha_t, temporal_acc, 1.0-alpha_t, 0)
+            disp = temporal_acc
+
         # Measure brightness on the gamma-corrected display frame so AE target
         # matches what you actually see on screen (every 5 frames is sufficient)
         if frame_n % 5 == 0:
@@ -714,6 +725,7 @@ def run(args):
             ctrl.reset()
             awb[:] = [1.60, 1.0, 1.40]
             sync_awb(*awb)
+            temporal_acc = None
             print("[RESET]")
         elif key == ord('p'):
             ctrl.print_state()
