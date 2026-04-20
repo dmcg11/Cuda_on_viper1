@@ -446,9 +446,9 @@ def create_controls():
     cv2.namedWindow(CTRL_WIN, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(CTRL_WIN, 500, 480)
     cv2.createTrackbar("Auto WB  (1=on)",   CTRL_WIN,   1,   1, lambda x: None)
-    cv2.createTrackbar("AWB R x100",        CTRL_WIN, 151, 400, lambda x: None)
+    cv2.createTrackbar("AWB R x100",        CTRL_WIN, 125, 400, lambda x: None)
     cv2.createTrackbar("AWB G x100",        CTRL_WIN, 100, 400, lambda x: None)
-    cv2.createTrackbar("AWB B x100",        CTRL_WIN, 175, 400, lambda x: None)
+    cv2.createTrackbar("AWB B x100",        CTRL_WIN, 265, 400, lambda x: None)
     cv2.createTrackbar("Black Level",       CTRL_WIN,  16,  64, lambda x: None)
     cv2.createTrackbar("CCM Strength x100", CTRL_WIN,   0, 100, lambda x: None)
     cv2.createTrackbar("Gamma x100",        CTRL_WIN, 220, 400, lambda x: None)
@@ -562,7 +562,7 @@ def run(args):
     cv2.namedWindow("IMX219 Tuning", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("IMX219 Tuning", 960, 540)
 
-    awb       = [1.51, 1.0, 1.75]  # Calibrated from Macbeth chart neutral patches
+    awb       = [1.25, 1.0, 2.65]  # Calibrated from Macbeth chart neutral patches
     alpha     = 0.05
     frame_n   = 0
     save_next     = False
@@ -713,7 +713,7 @@ def run(args):
             save_raw_next = True
         elif key == ord('r'):
             ctrl.reset()
-            awb[:] = [1.51, 1.0, 1.75]
+            awb[:] = [1.25, 1.0, 2.65]
             sync_awb(*awb)
             print("[RESET]")
         elif key == ord('p'):
