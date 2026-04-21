@@ -355,8 +355,10 @@ def process_frame(raw: np.ndarray, p: dict, full_res: bool = False) -> np.ndarra
     # 1. Black level subtraction
     raw_bl = np.clip(raw.astype(np.int16) - bl, 0, 255)
 
-    # 2. Pre-Bayer AWB via cached LUT (~1ms, no float allocs)
-    if abs(awb[0] - 1.0) > 0.01 or abs(awb[2] - 1.0) > 0.01:
+    # 2. Pre-Bayer AWB: only applied on full-res saves for best quality.
+    # Display path uses post-debayer LUT AWB (identical visually, no strided copy cost)
+    raw_u8 = raw_bl.astype(np.uint8)
+    if full_res and (abs(awb[0] - 1.0) > 0.01 or abs(awb[2] - 1.0) > 0.01):
         key_bayer = ('bl', round(awb[0],4), round(awb[2],4))
         if key_bayer not in _lut_cache:
             x = np.arange(256, dtype=np.float32)
@@ -368,7 +370,10 @@ def process_frame(raw: np.ndarray, p: dict, full_res: bool = False) -> np.ndarra
                 np.clip(x*awb[2], 0,255).astype(np.uint8),
             )
         lut_r, lut_gr, lut_gb, lut_b = _lut_cache[key_bayer]
-        raw_u8 = raw_bl.astype(np.uint8)
+        raw_u8[0::2, 0::2] = cv2.LUT(raw_u8[0::2, 0::2], lut_r)
+        raw_u8[0::2, 1::2] = cv2.LUT(raw_u8[0::2, 1::2], lut_gr)
+        raw_u8[1::2, 0::2] = cv2.LUT(raw_u8[1::2, 0::2], lut_gb)
+        raw_u8[1::2, 1::2] = cv2.LUT(raw_u8[1::2, 1::2], lut_b)
         raw_u8[0::2, 0::2] = cv2.LUT(raw_u8[0::2, 0::2], lut_r)
         raw_u8[0::2, 1::2] = cv2.LUT(raw_u8[0::2, 1::2], lut_gr)
         raw_u8[1::2, 0::2] = cv2.LUT(raw_u8[1::2, 0::2], lut_gb)
@@ -396,7 +401,7 @@ def process_frame(raw: np.ndarray, p: dict, full_res: bool = False) -> np.ndarra
 
     # 4+5. LUT (gamma only — AWB applied pre-Bayer above) then CCM
     # Pass unity AWB [1,1,1] and bl=0 since both already applied above
-    lut_b, lut_g, lut_r, M = _baked_luts([1.0, 1.0, 1.0], gamma, 0, ccm_s if ccm_s > 0.01 else 0.0)
+    lut_b, lut_g, lut_r, M = _baked_luts(awb, gamma, 0, ccm_s if ccm_s > 0.01 else 0.0)
     b = cv2.LUT(bgr[:, :, 0], lut_b)
     g = cv2.LUT(bgr[:, :, 1], lut_g)
     r = cv2.LUT(bgr[:, :, 2], lut_r)
