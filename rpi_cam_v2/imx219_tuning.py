@@ -352,33 +352,49 @@ def process_frame(raw: np.ndarray, p: dict, full_res: bool = False) -> np.ndarra
 
     t0 = t()
 
-    # 1. Black level clip
-    raw_bl = np.clip(raw.astype(np.int16) - bl, 0, 255).astype(np.uint8)
+    # 1. Black level subtraction
+    raw_bl = np.clip(raw.astype(np.int16) - bl, 0, 255)
+
+    # 2. Pre-Bayer AWB — apply per-channel gains to raw Bayer pixels before debayer
+    # More noise-efficient than post-debayer scaling: debayer sees correct channel
+    # ratios and produces sharper colour edges; also 4x fewer pixels per channel.
+    # RGGB: even rows = R(even cols), Gr(odd cols)
+    #        odd rows = Gb(even cols), B(odd cols)
+    if abs(awb[0] - 1.0) > 0.01 or abs(awb[2] - 1.0) > 0.01:
+        raw_f = raw_bl.astype(np.float32)
+        # Green channels get geometric mean of R and B gains to preserve white balance
+        gr_gain = float(np.sqrt(awb[0]))
+        gb_gain = float(np.sqrt(awb[2]))
+        raw_f[0::2, 0::2] *= awb[0]   # R
+        raw_f[0::2, 1::2] *= gr_gain   # Gr
+        raw_f[1::2, 0::2] *= gb_gain   # Gb
+        raw_f[1::2, 1::2] *= awb[2]    # B
+        np.clip(raw_f, 0, 255, out=raw_f)
+        raw_bl = raw_f
+
+    raw_u8 = raw_bl.astype(np.uint8)
     t1 = t()
 
     if full_res:
-        # Full res debayer for saving
-        bgr = _debayer_cuda(raw_bl) if HAS_CUDA else _debayer_cpu(raw_bl)
+        bgr = _debayer_cuda(raw_u8) if HAS_CUDA else _debayer_cpu(raw_u8)
         _pt['debayer'] += t() - t1
         _pt['resize']  += 0.0
     else:
-        # Correct 2x Bayer subsample: interleave R/Gr/Gb/B from every 2nd quad
-        # raw[::2, ::2] is WRONG — it only takes R pixels (monochrome result)
-        # Correct: take one of each color from each 2x2 Bayer quad
-        h2, w2 = raw_bl.shape[0]//2, raw_bl.shape[1]//2
+        h2, w2 = raw_u8.shape[0]//2, raw_u8.shape[1]//2
         raw_half = np.empty((h2, w2), dtype=np.uint8)
-        raw_half[0::2, 0::2] = raw_bl[0::4, 0::4]  # R  (rows 0,4,8... cols 0,4,8...)
-        raw_half[0::2, 1::2] = raw_bl[0::4, 1::4]  # Gr (rows 0,4,8... cols 1,5,9...)
-        raw_half[1::2, 0::2] = raw_bl[1::4, 0::4]  # Gb (rows 1,5,9... cols 0,4,8...)
-        raw_half[1::2, 1::2] = raw_bl[1::4, 1::4]  # B  (rows 1,5,9... cols 1,5,9...)
+        raw_half[0::2, 0::2] = raw_u8[0::4, 0::4]  # R
+        raw_half[0::2, 1::2] = raw_u8[0::4, 1::4]  # Gr
+        raw_half[1::2, 0::2] = raw_u8[1::4, 0::4]  # Gb
+        raw_half[1::2, 1::2] = raw_u8[1::4, 1::4]  # B
         t2 = t(); _pt['resize'] += t2 - t1
         bgr = _debayer_cuda(raw_half) if HAS_CUDA else _debayer_cpu(raw_half)
         _pt['debayer'] += t() - t2
 
     t2 = t()
 
-    # 4+5. Per-channel LUT (BL+AWB+gamma) then CCM
-    lut_b, lut_g, lut_r, M = _baked_luts(awb, gamma, bl, ccm_s if ccm_s > 0.01 else 0.0)
+    # 4+5. LUT (gamma only — AWB applied pre-Bayer above) then CCM
+    # Pass unity AWB [1,1,1] and bl=0 since both already applied above
+    lut_b, lut_g, lut_r, M = _baked_luts([1.0, 1.0, 1.0], gamma, 0, ccm_s if ccm_s > 0.01 else 0.0)
     b = cv2.LUT(bgr[:, :, 0], lut_b)
     g = cv2.LUT(bgr[:, :, 1], lut_g)
     r = cv2.LUT(bgr[:, :, 2], lut_r)
@@ -446,9 +462,9 @@ def create_controls():
     cv2.namedWindow(CTRL_WIN, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(CTRL_WIN, 500, 480)
     cv2.createTrackbar("Auto WB  (1=on)",   CTRL_WIN,   1,   1, lambda x: None)
-    cv2.createTrackbar("AWB R x100",        CTRL_WIN, 125, 400, lambda x: None)
+    cv2.createTrackbar("AWB R x100",        CTRL_WIN, 123, 400, lambda x: None)
     cv2.createTrackbar("AWB G x100",        CTRL_WIN, 100, 400, lambda x: None)
-    cv2.createTrackbar("AWB B x100",        CTRL_WIN, 265, 400, lambda x: None)
+    cv2.createTrackbar("AWB B x100",        CTRL_WIN, 272, 400, lambda x: None)
     cv2.createTrackbar("Black Level",       CTRL_WIN,  16,  64, lambda x: None)
     cv2.createTrackbar("CCM Strength x100", CTRL_WIN,   0, 100, lambda x: None)
     cv2.createTrackbar("Gamma x100",        CTRL_WIN, 220, 400, lambda x: None)
@@ -562,7 +578,7 @@ def run(args):
     cv2.namedWindow("IMX219 Tuning", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("IMX219 Tuning", 960, 540)
 
-    awb       = [1.25, 1.0, 2.65]  # Calibrated from Macbeth chart neutral patches
+    awb       = [1.23, 1.0, 2.72]  # Calibrated from Macbeth chart neutral patches
     alpha     = 0.05
     frame_n   = 0
     save_next     = False
@@ -713,7 +729,7 @@ def run(args):
             save_raw_next = True
         elif key == ord('r'):
             ctrl.reset()
-            awb[:] = [1.25, 1.0, 2.65]
+            awb[:] = [1.23, 1.0, 2.72]
             sync_awb(*awb)
             print("[RESET]")
         elif key == ord('p'):
