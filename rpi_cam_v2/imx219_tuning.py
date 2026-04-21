@@ -355,24 +355,26 @@ def process_frame(raw: np.ndarray, p: dict, full_res: bool = False) -> np.ndarra
     # 1. Black level subtraction
     raw_bl = np.clip(raw.astype(np.int16) - bl, 0, 255)
 
-    # 2. Pre-Bayer AWB — apply per-channel gains to raw Bayer pixels before debayer
-    # More noise-efficient than post-debayer scaling: debayer sees correct channel
-    # ratios and produces sharper colour edges; also 4x fewer pixels per channel.
-    # RGGB: even rows = R(even cols), Gr(odd cols)
-    #        odd rows = Gb(even cols), B(odd cols)
+    # 2. Pre-Bayer AWB via cached LUT (~1ms, no float allocs)
     if abs(awb[0] - 1.0) > 0.01 or abs(awb[2] - 1.0) > 0.01:
-        raw_f = raw_bl.astype(np.float32)
-        # Green channels get geometric mean of R and B gains to preserve white balance
-        gr_gain = float(np.sqrt(awb[0]))
-        gb_gain = float(np.sqrt(awb[2]))
-        raw_f[0::2, 0::2] *= awb[0]   # R
-        raw_f[0::2, 1::2] *= gr_gain   # Gr
-        raw_f[1::2, 0::2] *= gb_gain   # Gb
-        raw_f[1::2, 1::2] *= awb[2]    # B
-        np.clip(raw_f, 0, 255, out=raw_f)
-        raw_bl = raw_f
-
-    raw_u8 = raw_bl.astype(np.uint8)
+        key_bayer = ('bl', round(awb[0],4), round(awb[2],4))
+        if key_bayer not in _lut_cache:
+            x = np.arange(256, dtype=np.float32)
+            gr = float(np.sqrt(awb[0])); gb = float(np.sqrt(awb[2]))
+            _lut_cache[key_bayer] = (
+                np.clip(x*awb[0], 0,255).astype(np.uint8),
+                np.clip(x*gr,     0,255).astype(np.uint8),
+                np.clip(x*gb,     0,255).astype(np.uint8),
+                np.clip(x*awb[2], 0,255).astype(np.uint8),
+            )
+        lut_r, lut_gr, lut_gb, lut_b = _lut_cache[key_bayer]
+        raw_u8 = raw_bl.astype(np.uint8)
+        raw_u8[0::2, 0::2] = cv2.LUT(raw_u8[0::2, 0::2], lut_r)
+        raw_u8[0::2, 1::2] = cv2.LUT(raw_u8[0::2, 1::2], lut_gr)
+        raw_u8[1::2, 0::2] = cv2.LUT(raw_u8[1::2, 0::2], lut_gb)
+        raw_u8[1::2, 1::2] = cv2.LUT(raw_u8[1::2, 1::2], lut_b)
+    else:
+        raw_u8 = raw_bl.astype(np.uint8)
     t1 = t()
 
     if full_res:
@@ -691,27 +693,10 @@ def run(args):
             save_dng(raw, "snapshot_raw.dng")
             save_raw_next = False
 
-        # OSD
+        # OSD - FPS only
         t_d0 = time.perf_counter()
-        wb_mode = "AUTO" if c['auto_wb'] else "MAN"
-        brt = last_brt
-        osd = [
-            f"FPS: {fps:.1f}   Frame: {frame_n}",
-            f"Brightness: {brt:.0f} / target {c['ae_tgt']}",
-            f"AnaGain: {ctrl.analog_gain:.2f}x  DigGain: {ctrl.digital_gain:.2f}x",
-            f"Exposure: {ctrl.exposure_us:.0f} us ({ctrl.exposure_lines} lines)",
-            f"AWB [{wb_mode}]  R={awb[0]:.2f}  G={awb[1]:.2f}  B={awb[2]:.2f}",
-            f"CCM:{c['ccm_s']:.2f}  Gamma:{c['gamma']:.2f}  "
-            f"Sat:{c['sat']:.2f}  Sharp:{c['sharp']:.2f}",
-            f"ms: cap={sr['capture']:.0f} deb={sr['debayer']:.0f} "
-            f"rsz={sr['resize']:.0f} lut={sr['lut']:.0f} "
-            f"ccm={sr['ccm']:.0f} sat={sr['sat']:.0f} "
-            f"shp={sr['sharp']:.0f} TOT={sr['total']:.0f}",
-            f"{'[CUDA]' if HAS_CUDA else '[CPU]'} debayer",
-        ]
-        for i, txt in enumerate(osd):
-            cv2.putText(disp, txt, (10, 20 + i * 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 0), 1, cv2.LINE_AA)
+        cv2.putText(disp, f"FPS: {fps:.1f}", (10, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
         _pt['display'] += time.perf_counter() - t_d0
 
         t_show = time.perf_counter()
