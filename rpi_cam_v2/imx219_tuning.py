@@ -481,6 +481,7 @@ def create_controls():
     cv2.createTrackbar("Denoise (1=on)",    CTRL_WIN,   1,   1, lambda x: None)
     cv2.createTrackbar("Auto Exp (1=on)",   CTRL_WIN,   1,   1, lambda x: None)
     cv2.createTrackbar("AE Target",         CTRL_WIN, 120, 255, lambda x: None)
+    cv2.createTrackbar("REC clip (->1)",    CTRL_WIN,   0,   1, lambda x: None)
 
 
 def get_controls() -> dict:
@@ -498,6 +499,7 @@ def get_controls() -> dict:
         'denoise':  tb("Denoise (1=on)") == 1,
         'auto_aec': tb("Auto Exp (1=on)") == 1,
         'ae_tgt':   max(tb("AE Target"), 1),
+        'rec_btn':  tb("REC clip (->1)") == 1,
     }
 
 
@@ -663,6 +665,8 @@ def run(args):
     recording     = args.record is not None    # start immediately if --record given
     rec_path      = args.record or None         # None -> auto timestamped name
     rec_start     = None                        # wall-clock time the writer opened
+    rec_limit     = args.rec_secs               # active clip's auto-stop seconds (None=unlimited)
+    rec_btn_prev  = False                       # previous REC-clip button state (edge detect)
     fps       = 0.0
     fps_t0    = time.time()
     fps_count = 0
@@ -714,6 +718,18 @@ def run(args):
 
         c = get_controls()
         ae.target = c['ae_tgt']
+
+        # "REC clip" button: rising edge (0->1) starts a fixed-length clip, then
+        # the slider snaps back to 0 so it behaves like a momentary push-button.
+        if c['rec_btn'] and not rec_btn_prev:
+            if recorder is None and not recording:
+                recording = True
+                rec_limit = args.btn_secs        # button always uses its own length
+                rec_path  = None                 # force a fresh timestamped file
+            else:
+                print("[REC] already recording — button ignored")
+            cv2.setTrackbarPos("REC clip (->1)", CTRL_WIN, 0)
+        rec_btn_prev = c['rec_btn']
 
         # Rough debayer only every 5 frames — AEC reuses last brightness measurement
         # Subsample Bayer by 4x (every 4th pixel) for a tiny 480x270 image
@@ -785,7 +801,7 @@ def run(args):
                     recorder = VideoRecorder(rec_path, rfps, size,
                                              force_swenc=args.sw_encode)
                     rec_start = time.time()
-                    dur = f", {args.rec_secs:g}s" if args.rec_secs else ""
+                    dur = f", {rec_limit:g}s" if rec_limit else ""
                     print(f"[REC] \u25cf recording -> {rec_path}  "
                           f"{size[0]}x{size[1]} @ {recorder.fps:.1f}fps{dur}  "
                           f"[{recorder.backend}]")
@@ -795,9 +811,9 @@ def run(args):
             if recorder is not None:
                 recorder.write(disp)
                 # Auto-stop after the requested duration
-                if args.rec_secs and (time.time() - rec_start) >= args.rec_secs:
+                if rec_limit and (time.time() - rec_start) >= rec_limit:
                     recorder.close()
-                    print(f"[REC] \u25a0 auto-stopped after {args.rec_secs:g}s "
+                    print(f"[REC] \u25a0 auto-stopped after {rec_limit:g}s "
                           f"-> {rec_path}")
                     recorder  = None
                     recording = False
@@ -826,6 +842,7 @@ def run(args):
         elif key == ord('v'):
             if recorder is None:
                 recording = True            # opens lazily on next frame
+                rec_limit = args.rec_secs   # 'v' uses the CLI duration (or unlimited)
             else:
                 recorder.close()
                 print(f"[REC] \u25a0 stopped -> {rec_path}")
@@ -876,6 +893,9 @@ def _parse():
     p.add_argument("--rec-secs", type=float, default=None, metavar="X",
                    help="Record for X seconds then auto-stop (the preview keeps "
                         "running). Works with --record and the 'v' key.")
+    p.add_argument("--btn-secs", type=float, default=10.0, metavar="X",
+                   help="Clip length in seconds for the 'REC clip' GUI button "
+                        "(default 10). Independent of --rec-secs.")
     p.add_argument("--sw-encode", action="store_true",
                    help="Force the mp4v software encoder, skipping the Jetson "
                         "hardware H.264 path.")
