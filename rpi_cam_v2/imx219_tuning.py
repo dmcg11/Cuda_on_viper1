@@ -19,8 +19,9 @@ Register map  (linux/drivers/media/i2c/imx219.c):
   0x0158-0x0159  DIG_GAIN_GLOBAL_A  12-bit  0x0100–0x0FFF
   0x015A-0x015B  COARSE_INTEG_TIME  16-bit  4–65535 lines
 
-Usage:  python3 imx219_tuning.py
-Keys (camera window): q/ESC quit | s save snapshot.jpg | r reset | p print state
+Usage:  python3 imx219_tuning.py [--record [out.mp4]] [--rec-secs X] [--rec-fps N] [--sw-encode]
+Keys (camera window): q/ESC quit | s save snapshot.jpg | w save raw Bayer |
+                      v toggle video record | r reset | p print state
 """
 
 import argparse
@@ -572,6 +573,74 @@ def save_dng(raw: np.ndarray, filename: str):
 
 
 # ==============================================================================
+# Video recording  (Windows-playable output)
+# ==============================================================================
+class VideoRecorder:
+    """
+    Records processed BGR frames to a file that plays on Windows.
+
+    Backend preference:
+      1. Jetson hardware H.264 via GStreamer  -> .mp4  (best: plays everywhere,
+         small files, near-zero CPU — requires OpenCV built WITH GStreamer)
+      2. mp4v (MPEG-4 Part 2) software writer -> .mp4  (VLC-friendly fallback)
+
+    The writer is sized from the first frame it receives, so it always matches
+    the display resolution (960x540) exactly.
+    """
+
+    def __init__(self, path, fps, size, force_swenc=False):
+        self.path = path
+        self.fps  = float(max(fps, 1.0))
+        self.size = (int(size[0]), int(size[1]))   # (w, h)
+        self.backend = None
+        self._w = None
+        self._open(force_swenc)
+
+    def _open(self, force_swenc):
+        w, h = self.size
+
+        # 1) Jetson hardware H.264 encoder (GStreamer appsrc -> nvv4l2h264enc)
+        if not force_swenc:
+            gst = (
+                "appsrc ! video/x-raw,format=BGR ! videoconvert ! "
+                "video/x-raw,format=I420 ! nvvidconv ! "
+                "video/x-raw(memory:NVMM),format=NV12 ! "
+                "nvv4l2h264enc insert-sps-pps=1 idrinterval=15 "
+                "maxperf-enable=1 bitrate=10000000 ! "
+                f"h264parse ! qtmux ! filesink location={self.path}"
+            )
+            try:
+                vw = cv2.VideoWriter(gst, cv2.CAP_GSTREAMER, 0,
+                                     self.fps, (w, h), True)
+                if vw.isOpened():
+                    self._w = vw
+                    self.backend = "HW H.264 (nvv4l2h264enc/GStreamer)"
+                    return
+                vw.release()
+            except Exception:
+                pass   # GStreamer not in this build — fall through
+
+        # 2) Software mp4v fallback
+        vw = cv2.VideoWriter(self.path, cv2.VideoWriter_fourcc(*'mp4v'),
+                             self.fps, (w, h), True)
+        if vw.isOpened():
+            self._w = vw
+            self.backend = "mp4v software (open in VLC)"
+            return
+
+        raise RuntimeError("no working VideoWriter backend (tried HW H.264 + mp4v)")
+
+    def write(self, frame):
+        if self._w is not None:
+            self._w.write(frame)
+
+    def close(self):
+        if self._w is not None:
+            self._w.release()
+            self._w = None
+
+
+# ==============================================================================
 # Main loop
 # ==============================================================================
 def run(args):
@@ -590,6 +659,10 @@ def run(args):
     frame_n   = 0
     save_next     = False
     save_raw_next = False
+    recorder      = None                       # VideoRecorder instance when active
+    recording     = args.record is not None    # start immediately if --record given
+    rec_path      = args.record or None         # None -> auto timestamped name
+    rec_start     = None                        # wall-clock time the writer opened
     fps       = 0.0
     fps_t0    = time.time()
     fps_count = 0
@@ -598,7 +671,8 @@ def run(args):
     c         = get_controls()  # initialise controls before loop
 
     print("\nKeys (camera window must have focus):")
-    print("  q/ESC quit  |  s save snapshot.jpg  |  w save raw Bayer  |  r reset  |  p print state\n")
+    print("  q/ESC quit  |  s save snapshot.jpg  |  w save raw Bayer  |  "
+          "v toggle video record  |  r reset  |  p print state\n")
 
     while True:
         t_cap0 = time.perf_counter()
@@ -698,6 +772,38 @@ def run(args):
             save_dng(raw, "snapshot_raw.dng")
             save_raw_next = False
 
+        # Video recording — write the clean frame (before OSD is drawn on).
+        # Recorder is opened lazily so it auto-sizes to the display frame and,
+        # in auto mode, uses the measured FPS for correct playback speed.
+        if recording:
+            if recorder is None:
+                size = (disp.shape[1], disp.shape[0])
+                rfps = args.rec_fps if args.rec_fps else (fps if fps > 1 else 30.0)
+                if not rec_path:
+                    rec_path = time.strftime("capture_%Y%m%d_%H%M%S.mp4")
+                try:
+                    recorder = VideoRecorder(rec_path, rfps, size,
+                                             force_swenc=args.sw_encode)
+                    rec_start = time.time()
+                    dur = f", {args.rec_secs:g}s" if args.rec_secs else ""
+                    print(f"[REC] \u25cf recording -> {rec_path}  "
+                          f"{size[0]}x{size[1]} @ {recorder.fps:.1f}fps{dur}  "
+                          f"[{recorder.backend}]")
+                except RuntimeError as e:
+                    print(f"[REC] could not start: {e}")
+                    recording = False
+            if recorder is not None:
+                recorder.write(disp)
+                # Auto-stop after the requested duration
+                if args.rec_secs and (time.time() - rec_start) >= args.rec_secs:
+                    recorder.close()
+                    print(f"[REC] \u25a0 auto-stopped after {args.rec_secs:g}s "
+                          f"-> {rec_path}")
+                    recorder  = None
+                    recording = False
+                    rec_start = None
+                    rec_path  = args.record or None   # fresh name for next 'v'
+
         # OSD - FPS only
         t_d0 = time.perf_counter()
         cv2.putText(disp, f"FPS: {fps:.1f}", (10, 28),
@@ -717,6 +823,16 @@ def run(args):
             save_next = True
         elif key == ord('w'):
             save_raw_next = True
+        elif key == ord('v'):
+            if recorder is None:
+                recording = True            # opens lazily on next frame
+            else:
+                recorder.close()
+                print(f"[REC] \u25a0 stopped -> {rec_path}")
+                recorder  = None
+                recording = False
+                rec_start = None
+                rec_path  = args.record or None   # next 'v' gets a fresh name
         elif key == ord('r'):
             ctrl.reset()
             awb[:] = [1.23, 1.0, 2.72]
@@ -724,11 +840,15 @@ def run(args):
             print("[RESET]")
         elif key == ord('p'):
             ctrl.print_state()
+            wb_mode = "auto" if c['auto_wb'] else "manual"
             print(f"  AWB [{wb_mode}]: R={awb[0]:.3f}  G={awb[1]:.3f}  B={awb[2]:.3f}")
             print(f"  CCM:{c['ccm_s']:.2f}  Gamma:{c['gamma']:.2f}  "
                   f"Sat:{c['sat']:.2f}  Sharp:{c['sharp']:.2f}")
-            print(f"  Brightness: {brt:.1f}")
+            print(f"  Brightness: {last_brt:.1f}")
 
+    if recorder is not None:
+        recorder.close()                    # finalize the file (moov atom / EOS)
+        print(f"[REC] \u25a0 saved -> {rec_path}")
     cap.release()
     cv2.destroyAllWindows()
     i2c.close()
@@ -746,6 +866,19 @@ def _parse():
                    help="Sensor I2C address (default 0x10)")
     p.add_argument("--width",    type=int, default=1920)
     p.add_argument("--height",   type=int, default=1080)
+    p.add_argument("--record",   nargs="?", const="", default=None,
+                   help="Record processed video. Optional path (e.g. out.mp4); "
+                        "omit for a timestamped capture_*.mp4. Also toggled live "
+                        "with the 'v' key.")
+    p.add_argument("--rec-fps",  type=float, default=None,
+                   help="Recording framerate. Default: auto (uses measured FPS "
+                        "for correct playback speed).")
+    p.add_argument("--rec-secs", type=float, default=None, metavar="X",
+                   help="Record for X seconds then auto-stop (the preview keeps "
+                        "running). Works with --record and the 'v' key.")
+    p.add_argument("--sw-encode", action="store_true",
+                   help="Force the mp4v software encoder, skipping the Jetson "
+                        "hardware H.264 path.")
     return p.parse_args()
 
 
